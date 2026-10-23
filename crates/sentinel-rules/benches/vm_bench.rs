@@ -33,6 +33,7 @@ fn build_rules(n: usize) -> RuleFile {
                 multi_match: false,
                 setvars: vec![],
                 exclusions: vec![],
+                remove_targets: vec![],
             })
         })
         .collect();

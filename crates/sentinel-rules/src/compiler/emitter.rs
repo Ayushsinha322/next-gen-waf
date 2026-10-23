@@ -23,6 +23,7 @@ pub enum TargetSpec {
     RequestBody,
     RequestUri,
     RequestFilename,
+    RequestBasename,
     RequestMethod,
     RequestLine,
     RequestProtocol,
@@ -68,6 +69,11 @@ pub enum TargetSpec {
     MatchedVar,
     /// `MATCHED_VARS`: every value the previous link matched.
     MatchedVars,
+    /// `ARGS:name` (query then body) or `ARGS_GET:name` (query only).
+    ArgNamed {
+        name: String,
+        get_only: bool,
+    },
     CountOf(Box<TargetSpec>),
     /// `base` without the members `keys` name: a collection target its rule
     /// has exclusions for (`REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/`).
@@ -124,6 +130,7 @@ impl TargetSpec {
             TargetSpec::RequestBody => "REQUEST_BODY".into(),
             TargetSpec::RequestUri => "REQUEST_URI".into(),
             TargetSpec::RequestFilename => "REQUEST_FILENAME".into(),
+            TargetSpec::RequestBasename => "REQUEST_BASENAME".into(),
             TargetSpec::RequestMethod => "REQUEST_METHOD".into(),
             TargetSpec::RequestProtocol => "REQUEST_PROTOCOL".into(),
             TargetSpec::ReqbodyProcessor => "REQBODY_PROCESSOR".into(),
@@ -137,6 +144,9 @@ impl TargetSpec {
             TargetSpec::ArgsGetNames => "ARGS_GET_NAMES".into(),
             TargetSpec::QueryString => "QUERY_STRING".into(),
             TargetSpec::RequestCookie(c) => format!("REQUEST_COOKIES:{c}"),
+            TargetSpec::ArgNamed { name, get_only } => {
+                format!("{}:{name}", if *get_only { "ARGS_GET" } else { "ARGS" })
+            }
             TargetSpec::ResponseHeadersAll => "RESPONSE_HEADERS".into(),
             TargetSpec::ResponseHeader(h) => format!("RESPONSE_HEADERS:{h}"),
             TargetSpec::ResponseBody => "RESPONSE_BODY".into(),
@@ -169,6 +179,7 @@ impl From<&Target> for TargetSpec {
             Target::RequestBody => TargetSpec::RequestBody,
             Target::RequestUri => TargetSpec::RequestUri,
             Target::RequestFilename => TargetSpec::RequestFilename,
+            Target::RequestBasename => TargetSpec::RequestBasename,
             Target::RequestMethod => TargetSpec::RequestMethod,
             Target::RequestProtocol => TargetSpec::RequestProtocol,
             Target::ReqbodyProcessor => TargetSpec::ReqbodyProcessor,
@@ -177,6 +188,10 @@ impl From<&Target> for TargetSpec {
             Target::RequestHeaders(Some(h)) => TargetSpec::RequestHeader(h.clone()),
             Target::RequestCookies(None) => TargetSpec::RequestCookiesAll,
             Target::RequestCookies(Some(c)) => TargetSpec::RequestCookie(c.clone()),
+            Target::ArgNamed { name, get_only } => TargetSpec::ArgNamed {
+                name: name.clone(),
+                get_only: *get_only,
+            },
             Target::ResponseHeaders(None) => TargetSpec::ResponseHeadersAll,
             Target::ResponseHeaders(Some(h)) => TargetSpec::ResponseHeader(h.clone()),
             Target::ResponseBody => TargetSpec::ResponseBody,
@@ -356,6 +371,14 @@ pub enum Instruction {
         last: bool,
     },
 
+    /// Opens a rule that another rule's `ctl:ruleRemoveTargetById` may take a
+    /// target off. Emitted only for such rules (942440, for CRS 942441/942442):
+    /// the VM applies the removals the request has collected for this rule to
+    /// every target the rule loads, until its RuleEnd.
+    RuleStart {
+        rule_id: u32,
+    },
+
     /// Pop Bool from stack.  If true, apply the rule's action/score/log.
     /// The rule metadata is looked up by `rule_id` in `CompiledRuleSet::rule_meta`.
     RuleEnd {
@@ -388,6 +411,9 @@ pub struct RuleMeta {
     /// fires (executed by the VM in `fire_rule`).
     #[serde(default)]
     pub setvars: Vec<SetVar>,
+    /// `ctl:ruleRemoveTargetById` this rule applies to the request when it fires.
+    #[serde(default)]
+    pub remove_targets: Vec<(u32, String)>,
 }
 
 impl Default for RuleMeta {
@@ -402,6 +428,7 @@ impl Default for RuleMeta {
             phase: RulePhase::RequestBody,
             skip_after: None,
             setvars: Vec::new(),
+            remove_targets: Vec::new(),
         }
     }
 }

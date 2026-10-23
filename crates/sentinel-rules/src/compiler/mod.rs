@@ -120,6 +120,8 @@ fn starts_quantifier(chars: &[char], i: usize) -> bool {
 }
 
 struct CompilerState {
+    /// Rules some rule's `ctl:ruleRemoveTargetById` names (see RuleStart).
+    ctl_targets: std::collections::HashSet<u32>,
     patterns: Vec<Regex>,
     ac_set_words: Vec<Vec<String>>,
     literals: Vec<String>,
@@ -130,6 +132,7 @@ struct CompilerState {
 impl CompilerState {
     fn new() -> Self {
         Self {
+            ctl_targets: std::collections::HashSet::new(),
             patterns: Vec::new(),
             ac_set_words: Vec::new(),
             literals: Vec::new(),
@@ -199,6 +202,15 @@ impl CompilerState {
 /// Compile a (possibly mutated by analysis) `RuleFile` into a `CompiledRuleSet`.
 pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
     let mut state = CompilerState::new();
+    state.ctl_targets = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RuleItem::Rule(rule) => Some(rule.remove_targets.iter().map(|(id, _)| *id)),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     let mut phase_programs: [Vec<Instruction>; 7] = Default::default();
     let mut rule_meta: std::collections::HashMap<u32, RuleMeta> = std::collections::HashMap::new();
 
@@ -380,7 +392,14 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
         } else {
             rule.setvars.clone()
         },
+        remove_targets: rule.remove_targets.clone(),
     };
+
+    // A rule that another rule's ctl:ruleRemoveTargetById names opens with
+    // RuleStart, so the VM knows whose targets it is loading.
+    if state.ctl_targets.contains(&rule.id) {
+        instrs.push(Instruction::RuleStart { rule_id: rule.id });
+    }
 
     if !chained {
         emit_condition(
@@ -523,6 +542,7 @@ fn compile_virtual_patch(
         phase: vp.phase,
         skip_after: None,
         setvars: Vec::new(),
+        remove_targets: Vec::new(),
     };
 
     emit_condition(

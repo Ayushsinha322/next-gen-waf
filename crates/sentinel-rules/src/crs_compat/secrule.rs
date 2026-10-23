@@ -39,6 +39,11 @@ pub struct CrsActions {
     pub multi_match: bool,
     /// Unrecognised action tokens (emitted as warnings).
     pub unknown: Vec<String>,
+    /// `ctl:ruleRemoveTargetById=ID;TARGET`: when this rule fires, rule `ID`
+    /// stops inspecting `TARGET` for the rest of the request. CRS 942441/942442
+    /// lift 942440 (SQL comments) off `fbclid`/`gclid` only when the value is
+    /// shaped like a click identifier.
+    pub remove_targets: Vec<(u32, String)>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -289,7 +294,20 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
             );
         }
         "multimatch" => out.multi_match = true,
-        other if other.starts_with("ctl:") => {} // control directives — no-op
+        // Matched lower-cased like every token here; the target is read from
+        // the token as written, so a `/regex/` key keeps its case.
+        other if other.starts_with("ctl:ruleremovetargetbyid=") => {
+            let spec = &token["ctl:ruleRemoveTargetById=".len()..];
+            let parsed = spec
+                .split_once(';')
+                .and_then(|(id, target)| Some((id.trim().parse::<u32>().ok()?, target.trim())));
+            match parsed {
+                Some((id, target)) => out.remove_targets.push((id, target.to_owned())),
+                None => out.unknown.push(other.to_owned()),
+            }
+        }
+        // Other control directives have no per-request effect here.
+        other if other.starts_with("ctl:") => {}
         "chain" => {
             out.chain = true;
         }

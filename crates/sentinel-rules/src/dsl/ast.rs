@@ -57,6 +57,11 @@ pub struct RuleDef {
     /// `!REQUEST_COOKIES:/__utm/`, an operator's `ARGS:q`.
     #[serde(default)]
     pub exclusions: Vec<TargetExclusion>,
+    /// `ctl:ruleRemoveTargetById`: what this rule, when it fires, takes off
+    /// another rule for the rest of the request — `(rule, "ARGS:fbclid")`,
+    /// the target in the form `TargetExclusion::parse` reads.
+    #[serde(default)]
+    pub remove_targets: Vec<(RuleId, String)>,
 }
 
 /// `!COLLECTION:key` — one member of a collection a rule leaves out
@@ -169,6 +174,7 @@ impl Default for RuleDef {
             multi_match: false,
             setvars: Vec::new(),
             exclusions: Vec::new(),
+            remove_targets: Vec::new(),
         }
     }
 }
@@ -216,6 +222,10 @@ pub enum Target {
     RequestBody,
     RequestUri,
     RequestFilename,
+    /// The last component of REQUEST_FILENAME (`index.php`). It was read as
+    /// the whole path, so 942101's libinjection check saw `/post/1234 OR 1=1`
+    /// — whose `/post/` prefix hides the SQL — instead of `1234 OR 1=1`.
+    RequestBasename,
     RequestMethod,
     RequestLine,
     /// The request's HTTP version as ModSecurity spells it — `HTTP/1.1`,
@@ -289,6 +299,13 @@ pub enum Target {
     RemoteAddr,
     Geo,
     TxVar(String),
+    /// `ARGS:name` / `ARGS_GET:name`: that argument's values only — the name
+    /// compared case-insensitively — not the whole collection, which is what
+    /// the selector used to be widened to.
+    ArgNamed {
+        name: String,
+        get_only: bool,
+    },
     /// CRS `MATCHED_VAR`: the WHOLE value of the variable the previous link in
     /// this chain matched — the last one, when it matched several — not the
     /// text its pattern found. Only meaningful inside a chain.

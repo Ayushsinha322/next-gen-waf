@@ -242,6 +242,12 @@ fn secrule_directive_to_rule_with_actions(
         multi_match: actions.multi_match,
         setvars: actions.setvars.clone(),
         exclusions: parse_crs_target_exclusions(targets_str),
+        remove_targets: actions
+            .remove_targets
+            .iter()
+            .filter(|(_, target)| TargetExclusion::parse(target).is_some())
+            .cloned()
+            .collect(),
     }))
 }
 
@@ -301,11 +307,18 @@ fn token_to_target(tok: &str, rule_id: Option<u32>) -> Option<Target> {
     };
 
     let result: Option<Target> = match base {
+        // A named argument reads that argument only. A `/regex/` selector is
+        // still widened to the whole collection.
+        "ARGS" | "ARGS_GET" if sub.is_some_and(|s| !s.starts_with('/')) => Some(Target::ArgNamed {
+            name: sub.unwrap_or_default().to_owned(),
+            get_only: base == "ARGS_GET",
+        }),
         "ARGS" => Some(Target::Args),
         "ARGS_NAMES" => Some(Target::ArgsNames),
         "REQUEST_BODY" | "REQUEST_BODY_RAW" => Some(Target::RequestBody),
         "REQUEST_URI" | "REQUEST_URI_RAW" => Some(Target::RequestUri),
-        "REQUEST_FILENAME" | "REQUEST_BASENAME" => Some(Target::RequestFilename),
+        "REQUEST_FILENAME" => Some(Target::RequestFilename),
+        "REQUEST_BASENAME" => Some(Target::RequestBasename),
         "REQUEST_METHOD" => Some(Target::RequestMethod),
         "REQUEST_PROTOCOL" => Some(Target::RequestProtocol),
         "REQBODY_PROCESSOR" => Some(Target::ReqbodyProcessor),

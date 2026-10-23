@@ -155,9 +155,20 @@ fn percent_decode(s: &str) -> String {
 /// became `Ã©` whenever the value also held a `%`. An ASCII value whose `%XX`
 /// escapes are all below `%80` comes out exactly as before; non-ASCII text and
 /// high-byte escapes are what decode differently (correctly) now.
-fn url_decode_uni(s: &str) -> String {
-    // Fast path: if no `%`, nothing to decode.
-    if !s.contains('%') {
+///
+/// `plus` makes a literal `+` a space, as ModSecurity's urlDecodeUni does —
+/// in its one pass. The transform repeats the decode against double encoding
+/// (`to_fixpoint`), and those later passes must not turn a `+` that an
+/// earlier pass decoded from `%2B` into a space too: `c+at` reads `c at`,
+/// `c%2Bat` reads `c+at`, as in ModSecurity.
+///
+/// `%uFF01`..`%uFF5E` — full-width ASCII — become the ASCII they stand for,
+/// as ModSecurity maps them: `%uff1cscript%uff1e` is `<script>`. Any other
+/// `%uXXXX` decodes to its own character.
+fn url_decode_uni(s: &str, plus: bool) -> String {
+    // Fast path: nothing to decode.
+    let decodes = s.contains('%') || (plus && s.contains('+'));
+    if !decodes {
         return s.to_owned();
     }
 
@@ -170,6 +181,11 @@ fn url_decode_uni(s: &str) -> String {
             if matches!(b.get(i + 1), Some(b'u' | b'U')) {
                 // %uXXXX — exactly four hex digits naming a scalar value.
                 let cp = (i + 2..i + 6).try_fold(0u32, |acc, j| Some((acc << 4) | hex(j)?));
+                if let Some(cp @ 0xFF01..=0xFF5E) = cp {
+                    out.push((cp - 0xFEE0) as u8);
+                    i += 6;
+                    continue;
+                }
                 if let Some(ch) = cp.and_then(char::from_u32) {
                     out.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
                     i += 6;
@@ -180,6 +196,10 @@ fn url_decode_uni(s: &str) -> String {
                 i += 3;
                 continue;
             }
+        } else if plus && b[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -1576,6 +1596,7 @@ fn memo_policy(spec: &TargetSpec) -> Memo {
         | TargetSpec::RequestCookiesAll
         | TargetSpec::RequestCookiesNames
         | TargetSpec::RequestCookie(_)
+        | TargetSpec::ArgNamed { .. }
         | TargetSpec::MultipartPartHeadersAll
         | TargetSpec::MultipartPartHeader(_)
         | TargetSpec::Files
@@ -1585,6 +1606,7 @@ fn memo_policy(spec: &TargetSpec) -> Memo {
         TargetSpec::RequestBody | TargetSpec::ResponseBody => Memo::Chains,
         TargetSpec::RequestUri
         | TargetSpec::RequestFilename
+        | TargetSpec::RequestBasename
         | TargetSpec::RequestMethod
         | TargetSpec::RequestLine
         | TargetSpec::RequestProtocol
@@ -1813,6 +1835,15 @@ fn extract_target(
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
         TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
+        TargetSpec::RequestBasename => {
+            vec![ctx
+                .uri
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned()]
+        }
         TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
         TargetSpec::RequestLine => {
             vec![format!("{} {} {:?}", ctx.method, ctx.uri, ctx.http_version)]
@@ -1913,6 +1944,17 @@ fn extract_target(
             .filter(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
             .collect(),
+        TargetSpec::ArgNamed { name, get_only } => {
+            let named = |(k, v): (&str, &str)| k.eq_ignore_ascii_case(name).then(|| v.to_owned());
+            let query = views.query(ctx)?.iter().filter_map(named);
+            if *get_only {
+                query.collect()
+            } else {
+                query
+                    .chain(views.body(ctx)?.iter().filter_map(named))
+                    .collect()
+            }
+        }
         TargetSpec::ResponseHeadersAll => ctx
             .response_headers
             .as_ref()
@@ -2438,6 +2480,9 @@ pub fn evaluate(
     // link's MATCHED_VAR(S) reads.
     let mut link_values: Vec<String> = Vec::new();
     let mut matched_vars: Vec<String> = Vec::new();
+    // The targets `ctl:ruleRemoveTargetById` took off the rule now running
+    // (set by its RuleStart, cleared at its RuleEnd).
+    let mut rule_removals: Vec<crate::dsl::ast::TargetExclusion> = Vec::new();
     // The site's time budget for this call; see `TimeBudget`. Its clock is
     // read every `CLOCK_EVERY` instructions, and before every instruction
     // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
@@ -2492,6 +2537,13 @@ pub fn evaluate(
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
                 last_target = Some(spec);
+                let narrowed;
+                let spec = if rule_removals.is_empty() {
+                    spec
+                } else {
+                    narrowed = spec.clone().excluding(&rule_removals);
+                    &narrowed
+                };
                 // The compiler emits a target's transform chain right after
                 // it. For a memoizable target, take the transformed values
                 // from the memo and step over the ApplyTransforms. multiMatch
@@ -3052,7 +3104,17 @@ pub fn evaluate(
                 }
             }
 
+            Instruction::RuleStart { rule_id } => {
+                rule_removals = ctx
+                    .removed_targets
+                    .iter()
+                    .filter(|(id, _)| id == rule_id)
+                    .filter_map(|(_, target)| crate::dsl::ast::TargetExclusion::parse(target))
+                    .collect();
+            }
+
             Instruction::RuleEnd { rule_id } => {
+                rule_removals.clear();
                 let fired = pop_bool(&mut stack);
                 let matched_target = if targets_seen == 1 {
                     last_target.take().map(TargetSpec::label)
@@ -3197,6 +3259,15 @@ fn fire_rule(
                 .saturating_add(meta.score_delta as u32);
         } else {
             ctx.anomaly_score = ctx.anomaly_score.saturating_add(meta.score_delta as u32);
+        }
+    }
+
+    // `ctl:ruleRemoveTargetById`: for the rest of the request, the named rule
+    // no longer inspects the target (CRS 942441 lifting 942440 off a
+    // click-identifier-shaped `fbclid`).
+    for removal in &meta.remove_targets {
+        if !ctx.removed_targets.contains(removal) {
+            ctx.removed_targets.push(removal.clone());
         }
     }
 
@@ -3486,7 +3557,12 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
     match t {
         Transform::Lowercase => s.to_ascii_lowercase(),
         // Recursive: defeats double/triple URL-encoding evasion (%253Cscript).
-        Transform::UrlDecodeUni => to_fixpoint(s, 3, url_decode_uni),
+        // Recursive: defeats double/triple URL-encoding evasion (%253Cscript);
+        // only the first pass reads `+` as a space (see url_decode_uni).
+        Transform::UrlDecodeUni => {
+            let once = url_decode_uni(&s, true);
+            to_fixpoint(once, 2, |v| url_decode_uni(v, false))
+        }
         Transform::RemoveNulls => s.replace('\0', ""),
         Transform::ReplaceNulls => s.replace('\0', " "),
         // Recursive: defeats nested HTML-entity encoding (&amp;#60; -> &#60; -> <).
@@ -3502,17 +3578,22 @@ fn apply_single_transform(s: String, t: &Transform) -> String {
         Transform::Trim => s.trim().to_owned(),
         Transform::TrimLeft => s.trim_start().to_owned(),
         Transform::TrimRight => s.trim_end().to_owned(),
-        // UTF-8 to Unicode — replace non-ASCII bytes with \uXXXX (basic ASCII pass-through)
-        Transform::Utf8ToUnicode => s
-            .chars()
-            .flat_map(|c| {
-                if c.is_ascii() {
-                    vec![c]
+        // ModSecurity's form, `%uXXXX`, which the urlDecodeUni every CRS rule
+        // puts next reads back — mapping full-width ASCII to ASCII on the way.
+        // `\uXXXX` passed through urlDecodeUni untouched, so `＜script＞`
+        // never became `<script>`. A character beyond U+FFFF has no `%u`
+        // form and is kept.
+        Transform::Utf8ToUnicode => {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if c.is_ascii() || (c as u32) > 0xFFFF {
+                    out.push(c);
                 } else {
-                    format!("\\u{:04X}", c as u32).chars().collect::<Vec<_>>()
+                    out.push_str(&format!("%u{:04x}", c as u32));
                 }
-            })
-            .collect(),
+            }
+            out
+        }
         // Comment removal — strip /* ... */ style C comments
         Transform::RemoveCommentsChar => remove_comments_char(s),
         Transform::RemoveComments => remove_sql_comments(s),
@@ -5456,8 +5537,54 @@ mod transform_tests {
     /// `%XX` is a BYTE and `%uXXXX` a code point; the text is formed once, at
     /// the end, so a character is never split between two escapes or misread.
     #[test]
+    fn url_decode_uni_reads_plus_as_a_space_once() {
+        let t = |s: &str| apply_single_transform(s.to_owned(), &Transform::UrlDecodeUni);
+        // A literal `+` is a space, as ModSecurity's urlDecodeUni makes it.
+        assert_eq!(t("c+at+/et*/passwd"), "c at /et*/passwd");
+        // An escaped one is a `+` — also after the passes that undo double
+        // encoding, which must not turn a decoded `+` into a space.
+        assert_eq!(t("C%2B%2B"), "C++");
+        assert_eq!(t("1%252B1"), "1+1");
+        assert_eq!(t("a+b%20c"), "a b c");
+        // Nothing to decode: unchanged, plus or not.
+        assert_eq!(t("plain text"), "plain text");
+    }
+
+    #[test]
+    fn full_width_ascii_decodes_to_ascii() {
+        let t = |s: &str, chain: &[Transform]| apply_transforms(s.to_owned(), chain);
+        let crs = [Transform::Utf8ToUnicode, Transform::UrlDecodeUni];
+        // ModSecurity maps %uFF01..%uFF5E to the ASCII they stand for.
+        assert_eq!(
+            t("%uff1cscript%uff1e", &[Transform::UrlDecodeUni]),
+            "<script>"
+        );
+        // Raw full-width text reaches the same place through the chain every
+        // CRS rule uses: utf8toUnicode writes %uXXXX, urlDecodeUni reads it.
+        assert_eq!(
+            t("＜script＞alert(1)＜/script＞", &crs),
+            "<script>alert(1)</script>"
+        );
+        // Everything else comes back exactly as it was.
+        for text in [
+            "नमस्ते दुनिया",
+            "café crème",
+            "€ 20",
+            "日本語",
+            "emoji 😀",
+            "plain",
+        ] {
+            assert_eq!(t(text, &crs), text, "{text}");
+        }
+        assert_eq!(
+            apply_single_transform("é€a".to_owned(), &Transform::Utf8ToUnicode),
+            "%u00e9%u20aca"
+        );
+    }
+
+    #[test]
     fn url_decode_uni_keeps_multibyte_utf8() {
-        let d = url_decode_uni;
+        let d = |s: &str| url_decode_uni(s, true);
         // Escaped multi-byte characters: one `é`, not `é` plus U+FFFD.
         assert_eq!(d("caf%C3%A9"), "café");
         assert_eq!(d("%E2%82%AC"), "€");
@@ -5577,7 +5704,11 @@ mod transform_tests {
         // the malformed ones. Not ASCII input alone: `%C3%A9` is ASCII and the
         // old decoder still gave `é` plus a stray U+FFFD.
         for s in all_strings(&['%', 'u', 'U', '0', '4', '7'], 7) {
-            assert_eq!(url_decode_uni(&s), old_url_decode_uni(&s), "input {s:?}");
+            assert_eq!(
+                url_decode_uni(&s, true),
+                old_url_decode_uni(&s),
+                "input {s:?}"
+            );
         }
     }
 
