@@ -441,13 +441,30 @@ struct MultipartParts {
 /// any encoding with room for markup, and costs about what the arguments may.
 const WHOLE_BODY_FACTOR: u64 = 4;
 
-/// The length of `String::from_utf8_lossy(bytes)` — what a rule reading the
-/// bytes as text reads — without building it: each invalid sequence becomes
-/// U+FFFD, three bytes.
-fn lossy_len(bytes: &[u8]) -> usize {
+/// A body as REQUEST_BODY rules read it: UTF-8 where it is UTF-8, and each
+/// byte that is not as the Latin-1 character of its value — `\xac` is U+00AC,
+/// which is what a rule's `\xac` means, as ModSecurity's PCRE reads it.
+///
+/// It was `String::from_utf8_lossy`, which makes every such byte U+FFFD: CRS
+/// 944200, `\xac\xed\x00\x05`, the magic bytes of a Java serialization stream,
+/// could not match one sent as it is — octet-stream, x-java-serialized-object,
+/// no Content-Type — the form gadget-chain exploits of WebLogic, JBoss and
+/// Jenkins take.
+fn body_text(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        out.extend(chunk.invalid().iter().map(|&b| char::from(b)));
+    }
+    out
+}
+
+/// The length of [`body_text`] without building it: a byte that is not UTF-8
+/// is one of U+0080..U+00FF, two bytes.
+fn body_text_len(bytes: &[u8]) -> usize {
     bytes
         .utf8_chunks()
-        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 })
+        .map(|c| c.valid().len() + 2 * c.invalid().len())
         .sum()
 }
 
@@ -701,7 +718,10 @@ fn body_args(
                 };
                 let mut out = ParamsBuilder::new(budget);
                 flatten_json(&ArgName::from(""), &val, &mut names, &mut out)?;
-                out.finish()
+                let mut params = out.finish();
+                // JSON that parsed is UTF-8.
+                params.compact = std::str::from_utf8(body).ok().map(json_compact);
+                params
             }
             // Malformed JSON: fall back to scanning the raw body as one value
             // so obfuscated/broken payloads still reach the regex operators.
@@ -716,6 +736,34 @@ fn body_args(
         BodyParser::Xml => parse_xml_args(body, budget)?,
         BodyParser::Multipart | BodyParser::None => Params::default(),
     })
+}
+
+/// `json` without the whitespace between its tokens: REQUEST_BODY of a JSON
+/// body that parsed. ModSecurity leaves it empty, every key and value being
+/// ARGS; ours keeps the body as sent — escapes, numbers, structure — for the
+/// rules that read REQUEST_BODY alone, less the layout of pretty-printed JSON,
+/// whose line breaks were invalid characters to 920272 (PL3) on every such
+/// request. Whitespace inside a string is the string's own and stays.
+fn json_compact(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in json.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// True for XML and SOAP content types — `text/xml`, `application/xml`,
@@ -734,12 +782,36 @@ fn is_xml_content_type(ct: &str) -> bool {
 /// every attribute value (keyed by the attribute name), and every CDATA section
 /// — decoding the standard XML entities — so injection delivered inside XML
 /// reaches the ARGS operators. Comments, processing instructions, DOCTYPE
-/// declarations, namespaces, and DTDs are ignored. Malformed input fails open
+/// declarations, namespaces, and DTDs are not ARGS. Malformed input fails open
 /// (extracts what it can). Byte offsets only ever land on ASCII delimiters
 /// (`<`, `>`, `]]>`, …), so all `&str` slicing stays on char boundaries.
+///
+/// Unlike with ModSecurity's XML processor, every byte is inspected somewhere:
+/// - text, CDATA and attribute values are ARGS, read by every ARGS rule —
+///   ModSecurity reads them only through rules that name `XML:/*`, and
+///   attribute values only through those that name `XML://@*` (the Java family);
+/// - element and attribute names label their values but are not ARGS_NAMES,
+///   as ModSecurity does not inspect them either: a name that is an XML Name
+///   cannot hold the punctuation of an injection, and as ARGS_NAMES every
+///   `<id>` and `<session_id>` of a SOAP API was a command or session-fixation
+///   parameter to CRS (932236, 943120). A "name" that is not an XML Name —
+///   only malformed XML has one — stays in ARGS_NAMES;
+/// - REQUEST_BODY is the body as sent less its layout (`Params::compact`):
+///   whitespace-only text between tags is dropped, and a tab or line break
+///   inside a tag is a space, as XML's attribute-value normalization makes it.
+///   The rules that read REQUEST_BODY — the Java family, and the ones that read
+///   it still encoded (920260, 931110, the overlong-UTF-8 signature) — see
+///   everything they did, a class name used as an element name (XStream) and a
+///   payload in a comment or entity declaration included, without reading the
+///   indentation of pretty-printed XML as invalid characters (920272, PL3).
+///
+/// Namespace declarations (`xmlns`, `xmlns:p`) are not attributes in the XML
+/// data model and name no data, so their URIs are markup, not ARGS: as ARGS,
+/// every SOAP envelope's was an off-domain link to 931130.
 fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
     let text = String::from_utf8_lossy(body);
     let mut out = ParamsBuilder::new(budget);
+    let mut compact = String::new();
     // One name per tag, shared by every text node and CDATA section under it:
     // a long element name over thousands of nodes (split apart by comments)
     // is held once, not once per node.
@@ -750,20 +822,25 @@ fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
 
     while i < bytes.len() {
         if bytes[i] != b'<' {
-            // Text node — runs up to the next tag.
+            // Text node — runs up to the next tag. Whitespace alone is layout.
             let end = text[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
             let chunk = &text[i..end];
             if !chunk.trim().is_empty() {
                 out.push_shared(&cur_elem, decode_xml_entities(chunk))?;
+                compact.push_str(chunk);
             }
             i = end;
             continue;
         }
 
-        // A markup construct beginning at `<`.
+        // A markup construct beginning at `<`. One left unterminated ends the
+        // parse, and the rest of the body is REQUEST_BODY as it stands.
         if text[i..].starts_with("<!--") {
             match text[i + 4..].find("-->") {
-                Some(rel) => i += 4 + rel + 3,
+                Some(rel) => {
+                    compact.push_str(&text[i..i + 4 + rel + 3]);
+                    i += 4 + rel + 3;
+                }
                 None => break,
             }
         } else if text[i..].starts_with("<![CDATA[") {
@@ -774,6 +851,7 @@ fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
                     if !content.trim().is_empty() {
                         out.push_shared(&cur_elem, content.to_owned())?;
                     }
+                    compact.push_str(&text[i..start + rel + 3]);
                     i = start + rel + 3;
                 }
                 None => break,
@@ -781,7 +859,10 @@ fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
         } else if text[i..].starts_with("<?") || text[i..].starts_with("<!") {
             // Processing instruction / DOCTYPE / declaration — skip to `>`.
             match text[i..].find('>') {
-                Some(rel) => i += rel + 1,
+                Some(rel) => {
+                    compact.push_str(&text[i..i + rel + 1]);
+                    i += rel + 1;
+                }
                 None => break,
             }
         } else {
@@ -789,6 +870,11 @@ fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
             let Some(rel) = text[i + 1..].find('>') else {
                 break;
             };
+            let tag = &text[i..i + 1 + rel + 1];
+            compact.extend(tag.chars().map(|c| match c {
+                '\t' | '\n' | '\r' => ' ',
+                c => c,
+            }));
             let inner = text[i + 1..i + 1 + rel].trim();
             i = i + 1 + rel + 1;
             if let Some(_close) = inner.strip_prefix('/') {
@@ -803,8 +889,34 @@ fn parse_xml_args(body: &[u8], budget: ArgBudget) -> Result<Params, Unlisted> {
             }
         }
     }
+    compact.push_str(&text[i..]);
 
-    Ok(out.finish())
+    let mut params = out.finish();
+    params.label_only(|name| name.is_empty() || is_xml_name(name));
+    params.compact = Some(compact);
+    Ok(params)
+}
+
+/// Whether `s` is an XML 1.0 `Name`: a NameStartChar, then NameChars. What a
+/// well-formed document's element and attribute names are, so a name that is
+/// not one came from malformed XML.
+fn is_xml_name(s: &str) -> bool {
+    fn start(c: char) -> bool {
+        matches!(c,
+            ':' | 'A'..='Z' | '_' | 'a'..='z'
+            | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    }
+    let mut chars = s.chars();
+    chars.next().is_some_and(start)
+        && chars.all(|c| {
+            start(c)
+                || matches!(c,
+                    '-' | '.' | '0'..='9' | '\u{B7}'
+                    | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+        })
 }
 
 /// The local part of a possibly namespace-prefixed XML name
@@ -815,6 +927,7 @@ fn local_name(raw: &str) -> &str {
 
 /// Extract `name="value"` / `name='value'` attribute pairs from the portion of
 /// a start tag after the element name, decoding XML entities in each value.
+/// A namespace declaration is not one.
 fn extract_xml_attributes(attrs: &str, out: &mut ParamsBuilder) -> Result<(), Unlisted> {
     let chars: Vec<char> = attrs.chars().collect();
     let n = chars.len();
@@ -847,7 +960,8 @@ fn extract_xml_attributes(attrs: &str, out: &mut ParamsBuilder) -> Result<(), Un
                 if i < n {
                     i += 1; // consume the closing quote
                 }
-                if !name.is_empty() {
+                let namespace = name == "xmlns" || name.starts_with("xmlns:");
+                if !name.is_empty() && !namespace {
                     out.push(name, decode_xml_entities(&val))?;
                 }
             }
@@ -926,6 +1040,9 @@ fn decode_xml_entities(s: &str) -> String {
 /// copied per value, the blow-up `ArgName` exists to prevent, and every
 /// operator gives the same verdict on the same text. `&ARGS_NAMES` still
 /// counts one name per value (`len`).
+///
+/// An XML body's names are labels — what MATCHED_VAR_NAME, `ARGS:name` and an
+/// exclusion call a value — but not ARGS_NAMES; see `parse_xml_args`.
 #[derive(Debug, Default)]
 struct Params {
     names: Rc<Vec<String>>,
@@ -937,6 +1054,14 @@ struct Params {
     /// Bytes charged to the site's `max_inspected_arg_bytes`: every value,
     /// each listed name once, and a multipart file part's name and filename.
     bytes: u64,
+    /// `label_only[j]`: `names[j]` is not in ARGS_NAMES. Empty when every name
+    /// is, as for every body but XML.
+    label_only: Vec<bool>,
+    /// ARGS_NAMES when some names are labels only: `names` less those.
+    listed_names: Option<Rc<Vec<String>>>,
+    /// REQUEST_BODY when it is not the body as sent: an XML or JSON body that
+    /// parsed, less its layout whitespace. See `parse_xml_args`, `json_compact`.
+    compact: Option<String>,
 }
 
 impl Params {
@@ -980,6 +1105,30 @@ impl Params {
             .iter()
             .enumerate()
             .map(|(i, value)| (self.name(i), value.as_str()))
+    }
+
+    /// The names ARGS_NAMES lists.
+    fn args_names(&self) -> &Rc<Vec<String>> {
+        self.listed_names.as_ref().unwrap_or(&self.names)
+    }
+
+    /// Whether `names[j]` is in ARGS_NAMES.
+    fn in_args_names(&self, j: usize) -> bool {
+        !self.label_only.get(j).copied().unwrap_or(false)
+    }
+
+    /// Mark the names `label_only` holds for as labels, not ARGS_NAMES.
+    fn label_only(&mut self, label_only: impl Fn(&str) -> bool) {
+        self.label_only = self.names.iter().map(|n| label_only(n)).collect();
+        if self.label_only.iter().any(|&l| l) {
+            let listed = (self.names.iter().zip(&self.label_only))
+                .filter(|(_, &l)| !l)
+                .map(|(n, _)| n.clone())
+                .collect();
+            self.listed_names = Some(Rc::new(listed));
+        } else {
+            self.label_only.clear();
+        }
     }
 }
 
@@ -1117,6 +1266,7 @@ impl ParamsBuilder {
             values: Rc::new(self.values),
             name_of: self.name_of,
             bytes: self.bytes,
+            ..Params::default()
         }
     }
 }
@@ -1248,7 +1398,7 @@ impl<'a> RequestViews<'a> {
     /// A body no parser takes apart — text/plain, octet-stream,
     /// multipart/related, no Content-Type — reaches the rules only this way,
     /// so it is one argument of its whole length as the rules read it (see
-    /// `lossy_len`), after the query string's: as the malformed-JSON fallback
+    /// `body_text`), after the query string's: as the malformed-JSON fallback
     /// in `body_args` is.
     ///
     /// A body a parser takes apart was charged as its arguments, and is not
@@ -1260,7 +1410,7 @@ impl<'a> RequestViews<'a> {
             let Some(body) = ctx.request_body.as_deref().filter(|b| !b.is_empty()) else {
                 return Ok(());
             };
-            let len = lossy_len(body) as u64;
+            let len = body_text_len(body) as u64;
             match body_parser(self.content_type(ctx)) {
                 BodyParser::None => self.body_budget(ctx)?.charge(1, len),
                 _ => {
@@ -1308,22 +1458,27 @@ impl<'a> RequestViews<'a> {
         spec: &TargetSpec,
         ctx: &RequestContext,
     ) -> Result<Option<Rc<Vec<String>>>, Unlisted> {
-        let side = |params: &Params, names: bool| {
-            Rc::clone(if names { &params.names } else { &params.values })
-        };
+        fn side(params: &Params, names: bool) -> &Rc<Vec<String>> {
+            if names {
+                params.args_names()
+            } else {
+                &params.values
+            }
+        }
         Ok(match spec {
-            TargetSpec::ArgsGet => Some(side(self.query(ctx)?, false)),
-            TargetSpec::ArgsGetNames => Some(side(self.query(ctx)?, true)),
+            TargetSpec::ArgsGet => Some(Rc::clone(side(self.query(ctx)?, false))),
+            TargetSpec::ArgsGetNames => Some(Rc::clone(side(self.query(ctx)?, true))),
             // ARGS is the query parameters followed by the body ones. With one
             // side empty — a GET, or a POST without a query string — it IS the
             // other side; only a request carrying both needs a joined copy.
             TargetSpec::Args | TargetSpec::ArgsNames => {
                 let names = matches!(spec, TargetSpec::ArgsNames);
-                let (query, body) = (self.query(ctx)?, self.body(ctx)?);
+                let query = side(self.query(ctx)?, names);
+                let body = side(self.body(ctx)?, names);
                 if body.is_empty() {
-                    Some(side(query, names))
+                    Some(Rc::clone(query))
                 } else if query.is_empty() {
-                    Some(side(body, names))
+                    Some(Rc::clone(body))
                 } else {
                     None
                 }
@@ -1769,9 +1924,9 @@ fn extract_target(
                 TargetSpec::ArgsNames => {
                     let (query, body) = (views.query(ctx)?, views.body(ctx)?);
                     query
-                        .names
+                        .args_names()
                         .iter()
-                        .chain(body.names.iter())
+                        .chain(body.args_names().iter())
                         .filter(|n| !excluded(keys, n))
                         .cloned()
                         .collect()
@@ -1827,9 +1982,9 @@ fn extract_target(
             // `Params`. `&ARGS_NAMES` still counts each one (see `count`).
             let (query, body) = (views.query(ctx)?, views.body(ctx)?);
             query
-                .names
+                .args_names()
                 .iter()
-                .chain(body.names.iter())
+                .chain(body.args_names().iter())
                 .cloned()
                 .collect()
         }
@@ -1895,14 +2050,20 @@ fn extract_target(
         // this returns — and scanning them individually is strictly better for
         // wholly-encoded payloads, which only decode once separated from the
         // boundary noise.
+        //
+        // A parsed XML or JSON body's is the body less its layout whitespace;
+        // see `parse_xml_args` and `json_compact`.
         TargetSpec::RequestBody => {
             if views.content_type(ctx).starts_with("multipart/form-data") {
                 views.multipart(ctx)?.fields.values.to_vec()
             } else {
                 views.whole_body(ctx)?;
+                if let Some(compact) = &views.body(ctx)?.compact {
+                    return Ok(vec![compact.clone()]);
+                }
                 ctx.request_body
-                    .as_ref()
-                    .map(|b| vec![String::from_utf8_lossy(b).into_owned()])
+                    .as_deref()
+                    .map(|b| vec![body_text(b)])
                     .unwrap_or_default()
             }
         }
@@ -2108,7 +2269,7 @@ fn collect_sensitive_values(ctx: &RequestContext, views: &RequestViews) -> Vec<S
         }
         Err(_) => {
             if let Some(b) = ctx.request_body.as_ref() {
-                sensitive.push(String::from_utf8_lossy(b).into_owned());
+                sensitive.push(body_text(b));
             }
         }
     }
@@ -4316,11 +4477,13 @@ impl RequestValues {
                 if k.is_empty() {
                     return "REQUEST_BODY".into();
                 }
-                entries.push((
-                    Collection::ArgsNames,
-                    format!("ARGS_NAMES:{k}").into(),
-                    k.clone(),
-                ));
+                if body.in_args_names(body.listed(i)) {
+                    entries.push((
+                        Collection::ArgsNames,
+                        format!("ARGS_NAMES:{k}").into(),
+                        k.clone(),
+                    ));
+                }
                 format!("ARGS:{k}").into()
             });
             entries.push((Collection::ArgsPost, label.clone(), v.clone()));
@@ -4349,11 +4512,7 @@ impl RequestValues {
         // match "ambiguous".
         if !body_parsed {
             if let Some(b) = ctx.request_body.as_ref() {
-                entries.push((
-                    Collection::Body,
-                    "REQUEST_BODY".into(),
-                    String::from_utf8_lossy(b).into_owned(),
-                ));
+                entries.push((Collection::Body, "REQUEST_BODY".into(), body_text(b)));
             }
         }
         Self { entries }
@@ -4612,6 +4771,46 @@ SecRule REQUEST_BODY "@rx never-l" "id:15,phase:2,pass"
 SecRule ARGS "@rx hello" "id:16,phase:2,pass,msg:'fires',severity:'NOTICE'"
 SecRule ARGS|ARGS_NAMES "@rx never-m" "id:17,phase:2,pass,t:none,t:urlDecodeUni"
 "#;
+
+    /// CRS 944200 on a Java serialization stream sent as it is: REQUEST_BODY
+    /// read its non-UTF-8 bytes as U+FFFD, so `\xac\xed` was gone before the
+    /// rule saw it. ModSecurity matches all four of these (measured, CRS 4.7.0).
+    #[test]
+    fn a_raw_java_serialization_stream_reaches_the_magic_bytes_rule() {
+        let rs = ruleset(
+            r#"SecRule ARGS|REQUEST_BODY "@rx \xac\xed\x00\x05" "id:944200,phase:2,pass,msg:'java',severity:'CRITICAL'""#,
+        );
+        let stream: &[u8] = b"\xac\xed\x00\x05sr\x00\x11java.util.HashMap";
+        for (ct, body) in [
+            (Some("application/octet-stream"), stream.to_vec()),
+            (
+                Some("application/x-java-serialized-object"),
+                stream.to_vec(),
+            ),
+            (None, stream.to_vec()),
+            (
+                Some("application/x-www-form-urlencoded"),
+                [b"test=".as_slice(), &stream[..4]].concat(),
+            ),
+        ] {
+            let mut c = post("/invoker/readonly", ct.unwrap_or("x/x"), "");
+            if ct.is_none() {
+                c.request_headers.remove("content-type");
+            }
+            c.request_body = Some(bytes::Bytes::from(body));
+            evaluate(&rs, &mut c, Phase::RequestBody, 0);
+            assert!(
+                c.rule_matches.iter().any(|m| m.rule_id == "944200"),
+                "{ct:?}"
+            );
+        }
+        // UTF-8 stays UTF-8; only a byte that is not becomes its own character.
+        assert_eq!(body_text(b"a\xffb\xc3\xa9"), "a\u{ff}b\u{e9}");
+        assert_eq!(
+            body_text_len(b"a\xffb\xc3\xa9"),
+            body_text(b"a\xffb\xc3\xa9").len()
+        );
+    }
 
     /// Each request view is parsed at most once per `evaluate` call, however
     /// many rules read it. Every ARGS rule used to re-parse the query string
@@ -5286,6 +5485,172 @@ mod xml_tests {
         assert!(pairs.iter().any(|(k, v)| k == "a" && v == "hello"));
         let _ = parse_xml_args(b"<a href=\"unterminated", ArgBudget::UNLIMITED).unwrap();
         let _ = parse_xml_args(b"<![CDATA[unterminated", ArgBudget::UNLIMITED).unwrap();
+    }
+
+    const SOAP: &str = "<?xml version=\"1.0\"?>\n\
+        <soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n  \
+        <soap:Body>\n    <!-- note -->\n    <GetUser kind=\"full\">\n      \
+        <id>42</id>\n      <session_id>abc</session_id>\n    </GetUser>\n  \
+        </soap:Body>\n</soap:Envelope>\n";
+
+    fn xml_ctx(body: &str) -> RequestContext {
+        let mut ctx = RequestContext::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
+        ctx.method = http::Method::POST;
+        ctx.uri = "/svc".parse().unwrap();
+        ctx.request_headers
+            .insert("content-type", "text/xml".parse().unwrap());
+        ctx.request_body = Some(bytes::Bytes::from(body.to_owned()));
+        ctx
+    }
+
+    fn target(spec: TargetSpec, ctx: &RequestContext) -> Vec<String> {
+        extract_target(&spec, ctx, &RequestViews::default(), None).unwrap()
+    }
+
+    /// Element and attribute names label their values but are not ARGS_NAMES:
+    /// as ARGS_NAMES, `<id>` was a Unix command to 932236 and `<session_id>`
+    /// a session-fixation parameter to 943120 (PL1, no Referer) — on every
+    /// SOAP request carrying one. ModSecurity does not inspect XML names.
+    #[test]
+    fn xml_names_label_values_but_are_not_args_names() {
+        let ctx = xml_ctx(SOAP);
+        let params = args_of(&ctx);
+        assert!(params.iter().any(|(k, v)| k == "id" && v == "42"));
+        assert!(params.iter().any(|(k, v)| k == "session_id" && v == "abc"));
+        assert!(params.iter().any(|(k, v)| k == "kind" && v == "full"));
+        assert!(target(TargetSpec::ArgsNames, &ctx).is_empty());
+        // Nor through an exclusion's view of the collection.
+        let except = TargetSpec::Except {
+            base: Box::new(TargetSpec::ArgsNames),
+            keys: vec![],
+        };
+        assert!(target(except, &ctx).is_empty());
+        // Nor where the logger looks for the field a match came from.
+        let values = RequestValues::from_ctx(&ctx);
+        assert!(values.locate("ARGS_NAMES", "session_id").is_none());
+        assert_eq!(
+            values.locate("ARGS", "abc").as_deref(),
+            Some("ARGS:session_id")
+        );
+    }
+
+    /// A namespace declaration names no data: its URI was an off-domain link to
+    /// 931130 in every SOAP envelope. It stays in REQUEST_BODY.
+    #[test]
+    fn a_namespace_declaration_is_not_an_argument() {
+        let ctx = xml_ctx(SOAP);
+        let values = target(TargetSpec::Args, &ctx);
+        assert!(
+            !values.iter().any(|v| v.contains("schemas.xmlsoap.org")),
+            "{values:?}"
+        );
+        let body = target(TargetSpec::RequestBody, &ctx);
+        assert!(body[0].contains("xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\""));
+    }
+
+    /// REQUEST_BODY of an XML body is the body less its layout: the newlines
+    /// and indentation of pretty-printed XML were invalid characters to 920272
+    /// (PL3) on every such request. Everything else is as sent — values,
+    /// still encoded, for the rules that read REQUEST_BODY alone (920260,
+    /// 931110, the overlong-UTF-8 signature), and names for the Java family.
+    #[test]
+    fn xml_request_body_is_the_body_less_its_layout() {
+        let body = target(TargetSpec::RequestBody, &xml_ctx(SOAP));
+        assert_eq!(
+            body,
+            vec![
+                "<?xml version=\"1.0\"?>\
+                 <soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                 <soap:Body><!-- note --><GetUser kind=\"full\"><id>42</id>\
+                 <session_id>abc</session_id></GetUser></soap:Body></soap:Envelope>"
+            ]
+        );
+        // A line break inside a tag is a space; text keeps its own, and its
+        // escapes; CDATA is as sent.
+        let xml = "<a\n  b=\"1\"\r\n\tc='2'>x &amp;\ny<![CDATA[ %c0%af ]]></a>";
+        assert_eq!(
+            target(TargetSpec::RequestBody, &xml_ctx(xml)),
+            vec!["<a   b=\"1\"   c='2'>x &amp;\ny<![CDATA[ %c0%af ]]></a>"]
+        );
+        let java = "<xml>\n <java.lang.Runtime a=\"v\">value</java.lang.Runtime>\n</xml>";
+        assert_eq!(
+            target(TargetSpec::RequestBody, &xml_ctx(java)),
+            vec!["<xml><java.lang.Runtime a=\"v\">value</java.lang.Runtime></xml>"]
+        );
+    }
+
+    /// Where the parse stops, the rest of the body is REQUEST_BODY as sent:
+    /// nothing a lenient parse skipped goes uninspected.
+    #[test]
+    fn an_unterminated_construct_leaves_the_rest_in_request_body() {
+        for (xml, tail) in [
+            ("<a>x</a>\n<!-- ' or 1=1\n", "<!-- ' or 1=1\n"),
+            ("<a>x</a>\n<b c=\"' or 1=1\n", "<b c=\"' or 1=1\n"),
+            ("<a>\n<![CDATA[' or 1=1\n", "<![CDATA[' or 1=1\n"),
+            (
+                "<a>x</a>\n<!DOCTYPE x [<!ENTITY e \"' or 1=1\"\n",
+                "<!DOCTYPE x [<!ENTITY e \"' or 1=1\"\n",
+            ),
+        ] {
+            let body = target(TargetSpec::RequestBody, &xml_ctx(xml));
+            assert!(body[0].ends_with(tail), "{xml:?}: {body:?}");
+        }
+    }
+
+    /// Only malformed XML has a "name" that is not an XML Name, and such a name
+    /// can hold an injection's punctuation: it stays in ARGS_NAMES.
+    #[test]
+    fn a_name_no_xml_parser_would_accept_stays_in_args_names() {
+        let ctx = xml_ctx("<a b'or'1'='x'>y</a>");
+        assert_eq!(target(TargetSpec::ArgsNames, &ctx), vec!["b'or'1'"]);
+    }
+
+    #[test]
+    fn xml_names() {
+        for name in [
+            "a",
+            "soap:Envelope",
+            "_x",
+            "java.lang.Runtime",
+            "a-b.c_d:e9",
+            "élément",
+            "名前",
+        ] {
+            assert!(is_xml_name(name), "{name}");
+        }
+        for name in [
+            "", "9a", "-a", ".a", "a'b", "a\"", "a;b", "a(b)", "a b", "a=b", "a<b", "a/b",
+        ] {
+            assert!(!is_xml_name(name), "{name:?}");
+        }
+    }
+
+    /// A JSON body that parsed is REQUEST_BODY less its layout; one that did not
+    /// is REQUEST_BODY as sent.
+    #[test]
+    fn json_request_body_is_the_body_less_its_layout() {
+        let mut ctx = xml_ctx("");
+        ctx.request_headers
+            .insert("content-type", "application/json".parse().unwrap());
+        for (json, expected) in [
+            (
+                "{\n  \"a b\" : \"c\\\" d\\n\\t e\",\n\t\"f\": [1, 2.5e3, true, null, {}]\r\n}\n",
+                "{\"a b\":\"c\\\" d\\n\\t e\",\"f\":[1,2.5e3,true,null,{}]}",
+            ),
+            ("{\"x\": \"%c0%af\"}", "{\"x\":\"%c0%af\"}"),
+            ("{\n \"broken\": ", "{\n \"broken\": "),
+        ] {
+            ctx.request_body = Some(bytes::Bytes::from(json));
+            assert_eq!(
+                target(TargetSpec::RequestBody, &ctx),
+                vec![expected],
+                "{json:?}"
+            );
+        }
+    }
+
+    fn args_of(ctx: &RequestContext) -> Params {
+        body_args(ctx, BodyParser::Xml, ArgBudget::UNLIMITED).unwrap()
     }
 }
 
@@ -6407,11 +6772,11 @@ SecRule REQUEST_BODY "@rx ." "id:31,phase:2,pass,msg:'body read'"
         }
 
         // Charged as the rules read it: a byte that is not UTF-8 is read as
-        // U+FFFD, three bytes.
-        let mut c = request("", "application/octet-stream", "", limits(0, 6, 0));
+        // its Latin-1 character, two bytes.
+        let mut c = request("", "application/octet-stream", "", limits(0, 4, 0));
         c.request_body = Some(bytes::Bytes::from_static(b"\xff\xfe"));
         assert_eq!(run(&rs, &mut c), WafDecision::Allow);
-        let mut c = request("", "application/octet-stream", "", limits(0, 5, 0));
+        let mut c = request("", "application/octet-stream", "", limits(0, 3, 0));
         c.request_body = Some(bytes::Bytes::from_static(b"\xff\xfe"));
         assert_eq!(run(&rs, &mut c), WafDecision::Block);
 
