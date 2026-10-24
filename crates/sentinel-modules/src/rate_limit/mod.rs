@@ -546,22 +546,22 @@ impl RateLimiter {
         ip: IpAddr,
         config: &RateLimitConfig,
     ) -> Result<bool, StorageError> {
-        // 1-second sliding window; allow `rps + burst` requests within it so
-        // short bursts pass while sustained rate is capped (mirrors the
-        // token-bucket semantics of the in-memory path).
-        const WINDOW_MS: u64 = 1000;
+        // The in-memory limiter's model, shared across nodes: a bucket of
+        // `burst` refilling at `rps` (see RedisClient::token_bucket). Keys are
+        // new names: the window script's were sorted sets, and a node still
+        // running it during a rolling upgrade must not meet a hash.
         let mut limited = false;
 
         if let Some(ref global) = config.global {
-            let key = format!("rate:site:{site_id}");
-            let limit = (global.rps + global.burst) as u64;
-            limited |= !redis.rate_check(&key, limit, WINDOW_MS).await?;
+            let key = format!("rl:site:{site_id}");
+            limited |= !redis.token_bucket(&key, global.rps, global.burst).await?;
         }
 
         if let Some(ref per_ip_cfg) = config.per_ip {
-            let key = format!("rate:ip:{site_id}:{ip}");
-            let limit = (per_ip_cfg.rps + per_ip_cfg.burst) as u64;
-            limited |= !redis.rate_check(&key, limit, WINDOW_MS).await?;
+            let key = format!("rl:ip:{site_id}:{ip}");
+            limited |= !redis
+                .token_bucket(&key, per_ip_cfg.rps, per_ip_cfg.burst)
+                .await?;
         }
 
         Ok(limited)

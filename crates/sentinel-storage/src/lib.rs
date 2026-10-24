@@ -24,7 +24,7 @@
 //!     let handle = StorageHandle::connect(&cfg).await;
 //!
 //!     if let Some(redis) = &handle.redis {
-//!         let allowed = redis.rate_check("rate:ip:site1:1.2.3.4", 100, 1000).await.unwrap();
+//!         let allowed = redis.token_bucket("rl:ip:site1:1.2.3.4", 100, 200).await.unwrap();
 //!         println!("request allowed: {allowed}");
 //!     }
 //! }

@@ -122,38 +122,47 @@ impl RedisClient {
     }
 
     // -----------------------------------------------------------------------
-    // Distributed sliding-window rate limit
+    // Distributed token-bucket rate limit
     // -----------------------------------------------------------------------
 
-    /// Sliding-window rate check via atomic Lua.
+    /// Token-bucket rate check via atomic Lua: the model the in-memory limiter
+    /// uses (sentinel-modules `rate_limit`) — a bucket of `burst` tokens that
+    /// refills at `rps` a second and starts full; each request takes one.
     ///
-    /// `key`       — e.g. `"rate:ip:site1:1.2.3.4"`
-    /// `limit`     — max requests allowed within `window_ms`
-    /// `window_ms` — window length in milliseconds
+    /// This replaced a 1-second sliding window of `rps + burst` requests, which
+    /// gave the same settings a different meaning on a cluster: `rps` 10 and
+    /// `burst` 100 held one node to 10 a second sustained and let Valkey pass
+    /// 110 a second for ever.
     ///
     /// Returns `true` if the request is **allowed**, `false` if over-limit.
-    pub async fn rate_check(
+    pub async fn token_bucket(
         &self,
         key: &str,
-        limit: u64,
-        window_ms: u64,
+        rps: u32,
+        burst: u32,
     ) -> Result<bool, StorageError> {
-        // Millisecond timestamp passed in from Rust so the script doesn't need
-        // to call TIME (avoids a round-trip and keeps the Lua deterministic).
+        // Milliseconds from Rust, as the window script had them: no TIME call,
+        // and the script stays deterministic. Nodes' clocks differ a little;
+        // the script never lets the bucket's clock go backwards.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_millis() as i64;
-        let cutoff_ms = now_ms - window_ms as i64;
-        let expire_secs = (window_ms / 1000 + 2) as i64;
+        // Long enough for an idle bucket to fill up again; after that it is the
+        // same as a missing one, which starts full.
+        let ttl_secs = if rps == 0 {
+            3600
+        } else {
+            u64::from(burst).div_ceil(u64::from(rps)) as i64 + 2
+        };
 
         let mut conn = self.conn.clone();
-        let result: i64 = rate_script()
+        let result: i64 = bucket_script()
             .key(key)
             .arg(now_ms)
-            .arg(cutoff_ms)
-            .arg(limit as i64)
-            .arg(expire_secs)
+            .arg(rps)
+            .arg(burst)
+            .arg(ttl_secs)
             .invoke_async(&mut conn)
             .await?;
 
@@ -209,34 +218,38 @@ impl RedisClient {
     }
 }
 
-/// The sliding-window script, built once: `Script::new` hashes the source, and
-/// this runs on every rate-limited request.
-///
-/// ZSET-based sliding window:
-///   score  = arrival timestamp in ms
-///   member = "ts:seq" where seq is a per-key auto-increment
-/// Using a seq counter avoids collisions when multiple requests share the same
-/// millisecond timestamp.
-fn rate_script() -> &'static Script {
+/// The token-bucket script, built once: `Script::new` hashes the source, and
+/// this runs on every rate-limited request. A hash per key, `tokens` and `ts`
+/// (milliseconds), refilled by the time since `ts` at `rps` per second up to
+/// `burst`; one token per allowed request.
+fn bucket_script() -> &'static Script {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     SCRIPT.get_or_init(|| {
         Script::new(
             r#"
-            local key    = KEYS[1]
-            local now    = tonumber(ARGV[1])
-            local cutoff = tonumber(ARGV[2])
-            local lim    = tonumber(ARGV[3])
-            local exp    = tonumber(ARGV[4])
-            redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
-            local cnt = redis.call('ZCARD', key)
-            if cnt < lim then
-                local seq = redis.call('INCR', key .. ':seq')
-                redis.call('ZADD', key, now, now .. ':' .. seq)
-                redis.call('EXPIRE', key, exp)
-                redis.call('EXPIRE', key .. ':seq', exp)
-                return 1
+            local key  = KEYS[1]
+            local now  = tonumber(ARGV[1])
+            local rate = tonumber(ARGV[2])
+            local cap  = tonumber(ARGV[3])
+            local ttl  = tonumber(ARGV[4])
+            local st = redis.call('HMGET', key, 'tokens', 'ts')
+            local tokens = tonumber(st[1])
+            local ts = tonumber(st[2])
+            if tokens == nil or ts == nil then
+                tokens = cap
+                ts = now
             end
-            return 0
+            local elapsed = now - ts
+            if elapsed < 0 then elapsed = 0 end
+            tokens = math.min(cap, tokens + elapsed * rate / 1000)
+            local allowed = 0
+            if tokens >= 1 then
+                tokens = tokens - 1
+                allowed = 1
+            end
+            redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(math.max(now, ts)))
+            redis.call('EXPIRE', key, ttl)
+            return allowed
             "#,
         )
     })
@@ -273,21 +286,33 @@ mod tests {
         assert!(c.get(key).await.unwrap().is_none());
     }
 
+    /// The in-memory bucket's model: `burst` at once, then `rps` a second.
     #[tokio::test]
     #[ignore = "requires Redis"]
-    async fn rate_check_allows_within_limit() {
+    async fn token_bucket_bursts_then_refills_at_rps() {
         let c = RedisClient::connect(&redis_url()).await.unwrap();
-        let key = "test:rate:allow";
-        // 5 req/s limit, 1-second window
-        for _ in 0..5 {
-            assert!(c.rate_check(key, 5, 1000).await.unwrap(), "should allow");
+        let key = "test:rate:bucket";
+        c.del(key).await.ok();
+        // rps 10, burst 100: the window script let 110 through every second.
+        for i in 0..100 {
+            assert!(
+                c.token_bucket(key, 10, 100).await.unwrap(),
+                "request {i} of the burst"
+            );
         }
         assert!(
-            !c.rate_check(key, 5, 1000).await.unwrap(),
-            "6th should be denied"
+            !c.token_bucket(key, 10, 100).await.unwrap(),
+            "the burst is spent"
         );
+        // 1.05 s later: about 10 more, not another burst.
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        let mut refilled = 0;
+        while c.token_bucket(key, 10, 100).await.unwrap() {
+            refilled += 1;
+            assert!(refilled <= 11, "refills at rps, not by the burst");
+        }
+        assert!(refilled >= 10, "only {refilled} after a second at 10/s");
         c.del(key).await.ok();
-        c.del(&format!("{key}:seq")).await.ok();
     }
 
     #[tokio::test]
@@ -347,9 +372,9 @@ mod stub_tests {
         let fake = FakeValkey::start(EvalMode::Hang).await;
         let c = RedisClient::connect(&fake.url()).await.expect("handshake");
         let t = Instant::now();
-        let r = tokio::time::timeout(Duration::from_secs(5), c.rate_check("k", 10, 1000))
+        let r = tokio::time::timeout(Duration::from_secs(5), c.token_bucket("k", 10, 20))
             .await
-            .expect("rate_check hung");
+            .expect("token_bucket hung");
         assert!(r.is_err());
         assert!(
             t.elapsed() < Duration::from_secs(2),
@@ -386,7 +411,7 @@ mod stub_tests {
             .await
             .expect("connect_with_retry did not pick up the server")
             .unwrap();
-        assert!(client.rate_check("k", 10, 1000).await.unwrap());
+        assert!(client.token_bucket("k", 10, 20).await.unwrap());
         assert_eq!(fake.evals(), 1);
     }
 }
