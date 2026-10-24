@@ -8,13 +8,23 @@
 //! via `SENTINEL_CHALLENGE_SECRET`).
 //!
 //! Flow:
-//!   1. No clearance + no proof  → serve interstitial (embeds nonce/ts/diff/sig).
+//!   1. No clearance + no proof  → serve interstitial (embeds nonce/ts/diff/sig,
+//!      the signature covering the client's IP too).
 //!   2. Browser solves PoW, sets `sentinel_pow` cookie, reloads.
-//!   3. Proof verifies → issue `sentinel_clear` cookie (HMAC of ip|exp), 302 back.
+//!   3. Proof verifies — from the IP it was issued to, once — → issue
+//!      `sentinel_clear` cookie (HMAC of ip|exp), 302 back.
 //!   4. Clearance cookie present + valid → request passes (no re-challenge).
+//!
+//! A solved proof was a bearer token until 2026-10-23: not tied to an address
+//! and not spent when used, so one solve could be handed to every machine of a
+//! botnet within the 5-minute window, each getting its own 30-minute clearance.
+//! The signature now covers the IP the challenge was served to, and a proof is
+//! accepted once per node (`spend`) — across nodes the IP binding is what
+//! holds, as a replay from the same address could have solved its own.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::{header, HeaderMap, Uri};
@@ -140,8 +150,34 @@ pub fn clearance_valid(headers: &HeaderMap, ip: IpAddr) -> bool {
     sig_ok(&[&ip.to_string(), exp_s], sig)
 }
 
-/// Verify a submitted Proof-of-Work cookie: `nonce.ts.diff.sig.solution`.
-fn pow_valid(headers: &HeaderMap) -> bool {
+/// Most spent proofs this node remembers. Each entry cost its sender a solved
+/// proof, so reaching this takes real work; past it (after pruning the expired)
+/// a proof is refused and the client simply gets a fresh challenge.
+const MAX_SPENT: usize = 200_000;
+
+/// Proofs already accepted, by nonce, with the time their challenge expires.
+static SPENT: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Mark `nonce` spent; false if it already was (a replay) or there is no room.
+fn spend(nonce: &str, expires: u64, now: u64) -> bool {
+    let mut guard = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let spent = guard.get_or_insert_with(HashMap::new);
+    if spent.contains_key(nonce) {
+        return false;
+    }
+    if spent.len() >= MAX_SPENT {
+        spent.retain(|_, exp| *exp >= now);
+        if spent.len() >= MAX_SPENT {
+            return false;
+        }
+    }
+    spent.insert(nonce.to_owned(), expires);
+    true
+}
+
+/// Verify a submitted Proof-of-Work cookie, `nonce.ts.diff.sig.solution`, from
+/// `ip`: signed for that address, fresh, worked, and not seen before.
+fn pow_valid(headers: &HeaderMap, ip: IpAddr) -> bool {
     let Some(val) = cookie(headers, POW_COOKIE) else {
         return false;
     };
@@ -150,8 +186,9 @@ fn pow_valid(headers: &HeaderMap) -> bool {
         return false;
     }
     let (nonce, ts_s, diff_s, sig, solution) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
-    // 1. signature binds nonce+ts+diff (so the client can't forge an easy challenge)
-    if !sig_ok(&[nonce, ts_s, diff_s], sig) {
+    // 1. signature binds nonce+ts+diff (so the client can't forge an easy
+    //    challenge) and the IP it was issued to (so a solve is not portable)
+    if !sig_ok(&[nonce, ts_s, diff_s, &ip.to_string()], sig) {
         return false;
     }
     // 2. freshness
@@ -171,7 +208,11 @@ fn pow_valid(headers: &HeaderMap) -> bool {
     h.update(nonce.as_bytes());
     h.update(b".");
     h.update(solution.as_bytes());
-    leading_zero_bits(&h.finalize()) >= diff
+    if leading_zero_bits(&h.finalize()) < diff {
+        return false;
+    }
+    // 4. once: only after the work checked out, so a stored entry costs a solve
+    spend(nonce, ts + CHALLENGE_TTL_SECS, n)
 }
 
 fn make_clearance_cookie(ip: IpAddr) -> String {
@@ -209,7 +250,7 @@ pub fn resolve(headers: &HeaderMap, ip: IpAddr, uri: &Uri) -> Outcome {
     if clearance_valid(headers, ip) {
         return Outcome::Pass;
     }
-    if pow_valid(headers) {
+    if pow_valid(headers, ip) {
         // Proof accepted — grant clearance and bounce back to the original URL.
         let location = uri
             .path_and_query()
@@ -222,18 +263,18 @@ pub fn resolve(headers: &HeaderMap, ip: IpAddr, uri: &Uri) -> Outcome {
         };
     }
     Outcome::Serve {
-        html: interstitial(),
+        html: interstitial(ip),
     }
 }
 
-/// Build the interstitial HTML embedding a fresh, signed challenge.
-fn interstitial() -> String {
+/// Build the interstitial HTML embedding a fresh challenge, signed for `ip`.
+fn interstitial(ip: IpAddr) -> String {
     let mut nonce_bytes = [0u8; 8];
     let _ = SystemRandom::new().fill(&mut nonce_bytes);
     let nonce = hex::encode(nonce_bytes);
     let ts = now().to_string();
     let diff = DIFFICULTY_BITS.to_string();
-    let sig = sign(&[&nonce, &ts, &diff]);
+    let sig = sign(&[&nonce, &ts, &diff, &ip.to_string()]);
 
     // The PoW cookie must outlive the server's accept window, or a slow device
     // loses it before submitting a still-valid solution. Drive the cookie's
@@ -319,30 +360,84 @@ mod tests {
         h
     }
 
+    const IP: &str = "198.51.100.7";
+
+    fn ip() -> IpAddr {
+        IP.parse().unwrap()
+    }
+
     #[test]
     fn pow_roundtrip_accepts_valid_and_rejects_tampered() {
         let nonce = "0011223344556677";
         let ts = now().to_string();
         let diff = "12";
-        let sig = sign(&[nonce, &ts, diff]);
+        let sig = sign(&[nonce, &ts, diff, IP]);
         let sol = solve(nonce, 12);
-
-        let good = format!("{POW_COOKIE}={nonce}.{ts}.{diff}.{sig}.{sol}");
-        assert!(pow_valid(&headers_with(&good)), "valid proof must pass");
 
         // Forged signature (claim an easier challenge) must fail.
         let forged = format!("{POW_COOKIE}={nonce}.{ts}.4.deadbeef.{sol}");
-        assert!(!pow_valid(&headers_with(&forged)), "forged sig must fail");
+        assert!(
+            !pow_valid(&headers_with(&forged), ip()),
+            "forged sig must fail"
+        );
 
         // Right signature but wrong/insufficient solution must fail.
         let bad_sol = format!(
             "{POW_COOKIE}={nonce}.{ts}.30.{}.1",
-            sign(&[nonce, &ts, "30"])
+            sign(&[nonce, &ts, "30", IP])
         );
         assert!(
-            !pow_valid(&headers_with(&bad_sol)),
+            !pow_valid(&headers_with(&bad_sol), ip()),
             "insufficient work must fail"
         );
+
+        let good = format!("{POW_COOKIE}={nonce}.{ts}.{diff}.{sig}.{sol}");
+        assert!(
+            pow_valid(&headers_with(&good), ip()),
+            "valid proof must pass"
+        );
+    }
+
+    /// A solve was a bearer token: valid from any address, any number of times,
+    /// for the 5 minutes its challenge lived.
+    #[test]
+    fn a_solved_proof_is_bound_to_its_ip_and_spent_once() {
+        let nonce = "8899aabbccddeeff";
+        let ts = now().to_string();
+        let diff = "10";
+        let sig = sign(&[nonce, &ts, diff, IP]);
+        let sol = solve(nonce, 10);
+        let proof = headers_with(&format!("{POW_COOKIE}={nonce}.{ts}.{diff}.{sig}.{sol}"));
+
+        let elsewhere: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(
+            !pow_valid(&proof, elsewhere),
+            "another address must not use it"
+        );
+        assert!(pow_valid(&proof, ip()), "the address it was issued to may");
+        assert!(!pow_valid(&proof, ip()), "but only once");
+
+        // Through resolve: the second presentation gets a fresh challenge, not
+        // another clearance.
+        let uri: Uri = "/".parse().unwrap();
+        assert!(matches!(resolve(&proof, ip(), &uri), Outcome::Serve { .. }));
+    }
+
+    #[test]
+    fn the_served_challenge_is_signed_for_the_client_ip() {
+        let html = interstitial(ip());
+        let field = |name: &str| {
+            let start = html.find(&format!("{name}:")).unwrap() + name.len() + 1;
+            html[start..]
+                .split([',', '}'])
+                .next()
+                .unwrap()
+                .trim_matches('"')
+                .to_owned()
+        };
+        let (nonce, ts, diff, sig) = (field("nonce"), field("ts"), field("diff"), field("sig"));
+        assert!(sig_ok(&[&nonce, &ts, &diff, IP], &sig));
+        assert!(!sig_ok(&[&nonce, &ts, &diff, "203.0.113.9"], &sig));
     }
 
     #[test]
@@ -350,11 +445,11 @@ mod tests {
         let nonce = "aabbccddeeff0011";
         let old_ts = (now() - CHALLENGE_TTL_SECS - 10).to_string();
         let diff = "10";
-        let sig = sign(&[nonce, &old_ts, diff]);
+        let sig = sign(&[nonce, &old_ts, diff, IP]);
         let sol = solve(nonce, 10);
         let stale = format!("{POW_COOKIE}={nonce}.{old_ts}.{diff}.{sig}.{sol}");
         assert!(
-            !pow_valid(&headers_with(&stale)),
+            !pow_valid(&headers_with(&stale), ip()),
             "expired challenge must fail"
         );
     }
