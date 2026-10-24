@@ -18,6 +18,171 @@ use optimizer::build_ac;
 // Compiler state
 // ---------------------------------------------------------------------------
 
+/// `pattern` with each UTF-8 byte sequence it spells in `\xHH` escapes as the
+/// characters those bytes encode, or `None` if it spells none.
+///
+/// ModSecurity matches a pattern's bytes against the value's UTF-8 bytes, so
+/// CRS writes a non-ASCII character as its encoding: 934120 finds SSRF hosts
+/// spelled in enclosed alphanumerics (`①②⑦.⓪.⓪.①`) and ideographic full
+/// stops (`169。254。169。254`) with `\xe2(?:\x91[\xa0-\xbf]|…)` and
+/// `\xe3\x80\x82`. Here `\xe2` is the character U+00E2, so those alternatives
+/// matched nothing. A lead byte (`\xc2`–`\xf4`) followed by the continuation
+/// bytes its sequence needs — escapes, classes of escapes, and non-capturing
+/// groups of those — becomes a class of the characters; anything else is left
+/// alone, so a lone high byte (`\xac` in 944200, `\xbc` in 941310) keeps
+/// meaning the Latin-1 character the engine reads that byte as.
+fn utf8_sequences(pattern: &str) -> Option<String> {
+    /// The byte strings the items from `*i` spell, `need` bytes long, each a
+    /// continuation byte; `None` if the items there are not that.
+    fn tail(p: &[char], i: &mut usize, need: usize) -> Option<Vec<Vec<u8>>> {
+        let mut out: Vec<Vec<u8>> = vec![Vec::new()];
+        while out[0].len() < need {
+            let set = item(p, i)?;
+            let len = set.first()?.len();
+            if len == 0 || set.iter().any(|s| s.len() != len) || out[0].len() + len > need {
+                return None;
+            }
+            out = out
+                .iter()
+                .flat_map(|a| set.iter().map(move |b| [a.as_slice(), b].concat()))
+                .collect();
+            if out.len() > 4096 {
+                return None;
+            }
+        }
+        Some(out)
+    }
+    fn hex_escape(p: &[char], i: usize) -> Option<u8> {
+        if p.get(i) != Some(&'\\') || p.get(i + 1) != Some(&'x') {
+            return None;
+        }
+        let h: String = p.get(i + 2..i + 4)?.iter().collect();
+        u8::from_str_radix(&h, 16).ok()
+    }
+    fn cont(b: u8) -> Option<u8> {
+        (0x80..=0xbf).contains(&b).then_some(b)
+    }
+    /// One escape, class of escapes, or `(?:alt|alt)` of continuation bytes.
+    fn item(p: &[char], i: &mut usize) -> Option<Vec<Vec<u8>>> {
+        if let Some(b) = hex_escape(p, *i).and_then(cont) {
+            *i += 4;
+            return Some(vec![vec![b]]);
+        }
+        if p.get(*i) == Some(&'[') {
+            let mut j = *i + 1;
+            let mut bytes = Vec::new();
+            while p.get(j) != Some(&']') {
+                let lo = hex_escape(p, j).and_then(cont)?;
+                j += 4;
+                let hi = if p.get(j) == Some(&'-') {
+                    j += 1;
+                    let hi = hex_escape(p, j).and_then(cont)?;
+                    j += 4;
+                    hi
+                } else {
+                    lo
+                };
+                bytes.extend(lo..=hi);
+            }
+            *i = j + 1;
+            return Some(bytes.into_iter().map(|b| vec![b]).collect());
+        }
+        if p.get(*i..*i + 3) == Some(&['(', '?', ':']) {
+            let mut j = *i + 3;
+            let mut all = Vec::new();
+            loop {
+                let mut alt = vec![Vec::new()];
+                while !matches!(p.get(j), Some('|' | ')')) {
+                    let set = item(p, &mut j)?;
+                    alt = alt
+                        .iter()
+                        .flat_map(|a| set.iter().map(move |b| [a.as_slice(), b].concat()))
+                        .collect();
+                }
+                all.extend(alt);
+                j += 1;
+                if p[j - 1] == ')' {
+                    break;
+                }
+            }
+            *i = j;
+            return Some(all);
+        }
+        None
+    }
+
+    let p: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let (mut i, mut in_class, mut changed) = (0, false, false);
+    while i < p.len() {
+        let lead = (!in_class).then(|| hex_escape(&p, i)).flatten();
+        let need = match lead {
+            Some(0xc2..=0xdf) => 1,
+            Some(0xe0..=0xef) => 2,
+            Some(0xf0..=0xf4) => 3,
+            _ => 0,
+        };
+        if need > 0 {
+            let mut j = i + 4;
+            let chars: Option<Vec<char>> = tail(&p, &mut j, need).and_then(|tails| {
+                tails
+                    .iter()
+                    .map(|t| {
+                        let bytes = [&[lead?][..], t].concat();
+                        std::str::from_utf8(&bytes).ok()?.chars().next()
+                    })
+                    .collect()
+            });
+            if let Some(mut chars) = chars {
+                chars.sort_unstable();
+                chars.dedup();
+                out.push('[');
+                let mut k = 0;
+                while k < chars.len() {
+                    let start = chars[k];
+                    while k + 1 < chars.len() && chars[k + 1] as u32 == chars[k] as u32 + 1 {
+                        k += 1;
+                    }
+                    out.push_str(&format!("\\x{{{:x}}}", start as u32));
+                    if chars[k] != start {
+                        out.push_str(&format!("-\\x{{{:x}}}", chars[k] as u32));
+                    }
+                    k += 1;
+                }
+                out.push(']');
+                i = j;
+                changed = true;
+                continue;
+            }
+        }
+        match p[i] {
+            '\\' if i + 1 < p.len() => {
+                out.push(p[i]);
+                out.push(p[i + 1]);
+                i += 2;
+                continue;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ => {}
+        }
+        out.push(p[i]);
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
+/// An `@rx` pattern compiled as ModSecurity compiles it: `.` matches a line
+/// break too (PCRE_DOTALL, in ModSecurity v2 and v3 and in Coraza alike), and
+/// CRS is written and tested for that. Without it `\(.*\)` could not match
+/// `assert_options (\n\n)` (933160) nor `/\*.*\*/` a comment spanning lines,
+/// which the reference engine matches. `$` is the end of the value, as there.
+fn rx(pattern: &str) -> Result<Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .build()
+}
+
 /// Translate the PCRE constructs that `regex` rejects but ModSecurity accepts.
 ///
 /// CRS is written for PCRE. Two of its habits are hard errors for the `regex`
@@ -142,11 +307,13 @@ impl CompilerState {
     }
 
     fn intern_pattern(&mut self, pattern: &str) -> Result<usize> {
+        let utf8 = utf8_sequences(pattern);
+        let pattern = utf8.as_deref().unwrap_or(pattern);
         // Reuse identical patterns
         if let Some(idx) = self.patterns.iter().position(|r| r.as_str() == pattern) {
             return Ok(idx);
         }
-        let re = match Regex::new(pattern) {
+        let re = match rx(pattern) {
             Ok(re) => re,
             Err(_) => {
                 // The pattern is PCRE, written for ModSecurity. A handful of
@@ -158,7 +325,7 @@ impl CompilerState {
                 if let Some(idx) = self.patterns.iter().position(|r| r.as_str() == repaired) {
                     return Ok(idx);
                 }
-                Regex::new(&repaired).with_context(|| format!("invalid regex: {pattern}"))?
+                rx(&repaired).with_context(|| format!("invalid regex: {pattern}"))?
             }
         };
         let idx = self.patterns.len();
@@ -199,8 +366,50 @@ impl CompilerState {
 // Public compile function
 // ---------------------------------------------------------------------------
 
+/// Turn each `ctl:ruleRemoveTargetByTag` into the `ctl:ruleRemoveTargetById`
+/// entries it stands for: one per rule carrying the tag, as ModSecurity applies
+/// it to every rule so tagged. The VM then needs to know only rule IDs.
+fn expand_removals_by_tag(file: &mut RuleFile) {
+    let mut tagged: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
+    for item in &file.items {
+        if let RuleItem::Rule(rule) = item {
+            for tag in &rule.tags {
+                tagged.entry(tag.as_str()).or_default().push(rule.id);
+            }
+        }
+    }
+    let expanded: Vec<Vec<(u32, String)>> = file
+        .items
+        .iter()
+        .map(|item| match item {
+            RuleItem::Rule(rule) => rule
+                .remove_targets_by_tag
+                .iter()
+                .flat_map(|(tag, target)| {
+                    tagged
+                        .get(tag.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(move |&id| (id, target.clone()))
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    for (item, extra) in file.items.iter_mut().zip(expanded) {
+        if let RuleItem::Rule(rule) = item {
+            for removal in extra {
+                if !rule.remove_targets.contains(&removal) {
+                    rule.remove_targets.push(removal);
+                }
+            }
+        }
+    }
+}
+
 /// Compile a (possibly mutated by analysis) `RuleFile` into a `CompiledRuleSet`.
-pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
+pub fn compile(mut file: RuleFile) -> Result<CompiledRuleSet> {
+    expand_removals_by_tag(&mut file);
     let mut state = CompilerState::new();
     state.ctl_targets = file
         .items
@@ -374,7 +583,12 @@ pub fn compile(file: RuleFile) -> Result<CompiledRuleSet> {
 
 fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instruction>, RuleMeta)> {
     let mut instrs: Vec<Instruction> = Vec::new();
-    let chained = !rule.chain_conditions.is_empty();
+    // A rule whose setvar is named from the match runs it once per matched
+    // value, as ModSecurity does — CRS 921170 counts each parameter name with
+    // `TX.paramcounter_%{MATCHED_VAR_NAME}=+1` — which is what a chain link
+    // does; so such a rule is compiled as a chain of one link.
+    let chained =
+        !rule.chain_conditions.is_empty() || rule.setvars.iter().any(|sv| sv.name.contains("%{"));
     let meta = RuleMeta {
         id: rule.id,
         message: rule.message.clone().unwrap_or_default(),
@@ -452,7 +666,7 @@ fn compile_rule(rule: &RuleDef, state: &mut CompilerState) -> Result<(Vec<Instru
     instrs.push(Instruction::ChainLink {
         setvars: rule.setvars.clone(),
         to_end: 0,
-        last: false,
+        last: rule.chain_conditions.is_empty(),
     });
     for (i, chain) in rule.chain_conditions.iter().enumerate() {
         emit_link(
@@ -772,6 +986,41 @@ rule 942100 {
         let ruleset = compile(file).expect("compile");
         assert_eq!(ruleset.rule_meta.len(), 1);
         assert!(!ruleset.patterns.is_empty());
+    }
+
+    #[test]
+    fn utf8_sequences_become_the_characters_they_encode() {
+        // 934120's alternatives, as CRS writes them.
+        let p = utf8_sequences(
+            r"x(?:\xe2(?:\x91[\xa0-\xbf]|\x92[\x80-\xbf]|\x93[\x80-\xa9\xab-\xbf])|\xe3\x80\x82)+",
+        )
+        .expect("rewritten");
+        let re = rx(&p).unwrap();
+        for s in ["x①", "x⑳", "xⓛⓞ", "x。", "xⓩ"] {
+            assert!(re.is_match(s), "{s} against {p}");
+        }
+        // U+24EA (⓪, \xe2\x93\xaa) is outside the last class's ranges, as in CRS.
+        for s in ["x\u{24ea}", "xâ\u{91}", "x.", "x1"] {
+            assert!(!re.is_match(s), "{s:?} against {p}");
+        }
+        // A lone high byte means its Latin-1 character and is left alone.
+        for p in [
+            r"\xac\xed\x00\x05",
+            r"\xbc[^\xbe>]*[\xbe>]",
+            r"[a-zA-Z_\x7f-\xff]",
+            r"[\xe2\x80]",
+        ] {
+            assert_eq!(utf8_sequences(p), None, "{p}");
+        }
+        // A lead byte without its continuation is left alone too.
+        assert_eq!(utf8_sequences(r"\xe2\x41"), None);
+    }
+
+    #[test]
+    fn a_dot_matches_a_line_break() {
+        assert!(rx(r"\(.*\)").unwrap().is_match("(\n\n)"));
+        assert!(rx(r"^a$").unwrap().is_match("a"));
+        assert!(!rx(r"^a$").unwrap().is_match("a\n"));
     }
 
     #[test]

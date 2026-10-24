@@ -44,6 +44,10 @@ pub struct CrsActions {
     /// lift 942440 (SQL comments) off `fbclid`/`gclid` only when the value is
     /// shaped like a click identifier.
     pub remove_targets: Vec<(u32, String)>,
+    /// `ctl:ruleRemoveTargetByTag=TAG;TARGET`: the same for every rule tagged
+    /// `TAG`. CRS 941010 lifts REQUEST_FILENAME off the 34 rules tagged
+    /// `xss-perf-disable` when the path holds only filename characters.
+    pub remove_targets_by_tag: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -304,6 +308,15 @@ fn parse_action_token(token: &str, out: &mut CrsActions) {
             match parsed {
                 Some((id, target)) => out.remove_targets.push((id, target.to_owned())),
                 None => out.unknown.push(other.to_owned()),
+            }
+        }
+        other if other.starts_with("ctl:ruleremovetargetbytag=") => {
+            let spec = &token["ctl:ruleRemoveTargetByTag=".len()..];
+            match spec.split_once(';') {
+                Some((tag, target)) if !tag.trim().is_empty() && !target.trim().is_empty() => out
+                    .remove_targets_by_tag
+                    .push((tag.trim().to_owned(), target.trim().to_owned())),
+                _ => out.unknown.push(other.to_owned()),
             }
         }
         // Other control directives have no per-request effect here.

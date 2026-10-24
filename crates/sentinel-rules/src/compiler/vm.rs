@@ -1781,6 +1781,23 @@ fn memo_policy(spec: &TargetSpec) -> Memo {
 }
 
 /// Whether a member called `name` is one `keys` leaves out.
+/// MATCHED_VAR_NAME of the `i`th value of the target labelled `label`.
+///
+/// A names collection's value is the member's name, so it is `ARGS_NAMES:a`,
+/// as ModSecurity names it: two parameters called `a` share it, which is how
+/// CRS 921170 counts them (`TX.paramcounter_%{MATCHED_VAR_NAME}`) for 921180's
+/// parameter-pollution check — named by place, every parameter was counted
+/// once. Any other collection's is the value's place, `ARGS:3`: unique per
+/// value, which is what a setvar named from it (931130) needs, where
+/// ModSecurity's would be `ARGS:url` — the names are not carried with values.
+fn var_name(label: &str, i: usize, value: &str) -> String {
+    if label.ends_with("_NAMES") {
+        format!("{label}:{value}")
+    } else {
+        format!("{label}:{i}")
+    }
+}
+
 fn excluded(keys: &[ExclusionKey], name: &str) -> bool {
     keys.iter().any(|key| match key {
         ExclusionKey::Name(n) => n.eq_ignore_ascii_case(name),
@@ -1989,15 +2006,14 @@ fn extract_target(
                 .collect()
         }
         TargetSpec::RequestUri => vec![ctx.uri.to_string()],
-        TargetSpec::RequestFilename => vec![ctx.uri.path().to_owned()],
+        // The path URL-decoded once, as ModSecurity reads it: Apache unescapes
+        // the path before the rules run, and CRS writes its REQUEST_FILENAME
+        // rules for that. Read raw, `/post/subSTR%28%24x%29` was no PHP call to
+        // 933160 (t:none), which matches it on the reference engine.
+        TargetSpec::RequestFilename => vec![percent_decode(ctx.uri.path())],
         TargetSpec::RequestBasename => {
-            vec![ctx
-                .uri
-                .path()
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_owned()]
+            let path = percent_decode(ctx.uri.path());
+            vec![path.rsplit('/').next().unwrap_or_default().to_owned()]
         }
         TargetSpec::RequestMethod => vec![ctx.method.as_str().to_owned()],
         TargetSpec::RequestLine => {
@@ -2642,8 +2658,10 @@ pub fn evaluate(
     let mut link_values: Vec<String> = Vec::new();
     let mut matched_vars: Vec<String> = Vec::new();
     // The targets `ctl:ruleRemoveTargetById` took off the rule now running
-    // (set by its RuleStart, cleared at its RuleEnd).
+    // (set by its RuleStart, cleared at its RuleEnd): members of collections,
+    // and whole targets by label.
     let mut rule_removals: Vec<crate::dsl::ast::TargetExclusion> = Vec::new();
+    let mut rule_dropped: Vec<String> = Vec::new();
     // The site's time budget for this call; see `TimeBudget`. Its clock is
     // read every `CLOCK_EVERY` instructions, and before every instruction
     // while `large_values` — the last target loaded `CLOCK_BYTES` or more.
@@ -2698,6 +2716,13 @@ pub fn evaluate(
                 // inspected exactly one target, and left empty otherwise.
                 targets_seen += 1;
                 last_target = Some(spec);
+                // A target taken off this rule whole reads as nothing.
+                if !rule_dropped.is_empty() && rule_dropped.contains(&spec.label()) {
+                    large_values = false;
+                    stack.push(StackVal::Strings(Rc::new(Vec::new())));
+                    ip += 1;
+                    continue;
+                }
                 let narrowed;
                 let spec = if rule_removals.is_empty() {
                     spec
@@ -2867,7 +2892,7 @@ pub fn evaluate(
                     let before = link_values.len();
                     for (i, s) in values.iter().enumerate() {
                         if !regex.is_match(s) {
-                            link_matches.push((Vec::new(), format!("{label}:{i}")));
+                            link_matches.push((Vec::new(), var_name(&label, i, s)));
                             link_values.push(s.clone());
                         }
                     }
@@ -2876,10 +2901,7 @@ pub fn evaluate(
                 } else {
                     let regex = &ruleset.patterns[*pattern_id];
                     let mut hit = false;
-                    // Each match's MATCHED_VAR_NAME: the target and the value's
-                    // place in it — unique per value, which is what a setvar
-                    // named from it (CRS 931130) needs. ModSecurity's would be
-                    // `ARGS:url`; the parameter names are not carried here.
+                    // Each match's MATCHED_VAR_NAME; see `var_name`.
                     let label = last_target.map(TargetSpec::label).unwrap_or_default();
                     for (i, s) in values.iter().enumerate() {
                         let Some(caps) = regex.captures(s) else {
@@ -2895,7 +2917,7 @@ pub fn evaluate(
                             record_match(&mut last_matched, caps.get(0).map(|m| m.as_str()));
                             hit = true;
                         }
-                        link_matches.push((groups, format!("{label}:{i}")));
+                        link_matches.push((groups, var_name(&label, i, s)));
                         link_values.push(s.clone());
                     }
                     stack.push(StackVal::Bool(hit));
@@ -3266,16 +3288,20 @@ pub fn evaluate(
             }
 
             Instruction::RuleStart { rule_id } => {
-                rule_removals = ctx
-                    .removed_targets
-                    .iter()
-                    .filter(|(id, _)| id == rule_id)
+                let removed = ctx.removed_targets.iter().filter(|(id, _)| id == rule_id);
+                rule_removals = removed
+                    .clone()
                     .filter_map(|(_, target)| crate::dsl::ast::TargetExclusion::parse(target))
+                    .collect();
+                rule_dropped = removed
+                    .filter(|(_, target)| !target.contains(':'))
+                    .map(|(_, target)| target.to_ascii_uppercase())
                     .collect();
             }
 
             Instruction::RuleEnd { rule_id } => {
                 rule_removals.clear();
+                rule_dropped.clear();
                 let fired = pop_bool(&mut stack);
                 let matched_target = if targets_seen == 1 {
                     last_target.take().map(TargetSpec::label)

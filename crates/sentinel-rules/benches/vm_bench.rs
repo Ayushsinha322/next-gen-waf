@@ -34,6 +34,7 @@ fn build_rules(n: usize) -> RuleFile {
                 setvars: vec![],
                 exclusions: vec![],
                 remove_targets: vec![],
+                remove_targets_by_tag: vec![],
             })
         })
         .collect();

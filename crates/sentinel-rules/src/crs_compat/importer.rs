@@ -245,10 +245,26 @@ fn secrule_directive_to_rule_with_actions(
         remove_targets: actions
             .remove_targets
             .iter()
-            .filter(|(_, target)| TargetExclusion::parse(target).is_some())
+            .filter(|(_, target)| removable(target))
+            .cloned()
+            .collect(),
+        remove_targets_by_tag: actions
+            .remove_targets_by_tag
+            .iter()
+            .filter(|(_, target)| removable(target))
             .cloned()
             .collect(),
     }))
+}
+
+/// Whether a `ctl:ruleRemoveTarget…` target is one the VM can take off a rule:
+/// a member of a collection (`ARGS:fbclid`), or a whole target this importer
+/// reads (`REQUEST_FILENAME`), named as `TargetSpec::label` names it.
+fn removable(target: &str) -> bool {
+    match target.split_once(':') {
+        Some(_) => TargetExclusion::parse(target).is_some(),
+        None => token_to_target(&target.to_ascii_uppercase(), None).is_some(),
+    }
 }
 
 /// The `!COLLECTION:key` tokens of a target list. `token_to_target` drops

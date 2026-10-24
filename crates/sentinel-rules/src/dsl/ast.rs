@@ -58,10 +58,16 @@ pub struct RuleDef {
     #[serde(default)]
     pub exclusions: Vec<TargetExclusion>,
     /// `ctl:ruleRemoveTargetById`: what this rule, when it fires, takes off
-    /// another rule for the rest of the request — `(rule, "ARGS:fbclid")`,
-    /// the target in the form `TargetExclusion::parse` reads.
+    /// another rule for the rest of the request — `(rule, "ARGS:fbclid")`, a
+    /// member in the form `TargetExclusion::parse` reads, or a whole target
+    /// (`REQUEST_FILENAME`).
     #[serde(default)]
     pub remove_targets: Vec<(RuleId, String)>,
+    /// `ctl:ruleRemoveTargetByTag`: the same, for every rule carrying the tag —
+    /// `("xss-perf-disable", "REQUEST_FILENAME")`. `compile` turns each into
+    /// `remove_targets` entries, as the tagged rules are known there.
+    #[serde(default)]
+    pub remove_targets_by_tag: Vec<(String, String)>,
 }
 
 /// `!COLLECTION:key` — one member of a collection a rule leaves out
@@ -175,6 +181,7 @@ impl Default for RuleDef {
             setvars: Vec::new(),
             exclusions: Vec::new(),
             remove_targets: Vec::new(),
+            remove_targets_by_tag: Vec::new(),
         }
     }
 }
