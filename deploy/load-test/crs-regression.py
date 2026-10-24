@@ -23,7 +23,7 @@ WHY THIS AND NOT go-ftw
 
 go-ftw is the CRS project's runner, and these are its test files, unmodified.
 go-ftw decides which rules fired by reading a ModSecurity error log between two
-marker requests (`X-CRS-Test: <uuid>`), looking for `[id "942100"]`. The data
+marker requests, looking for `[id "942100"]`. The data
 plane logs neither, so this runner sends the tests one at a time and reads the
 rule IDs from the data plane's own logs. Requests are built as go-ftw builds
 them (ftwhttp/request.go): header autocompletion, a urlencoded body escaped, a
@@ -31,8 +31,9 @@ multipart body's line feeds made CRLF.
 
 CORRELATION
 
-Each request carries `X-CRS-Test: <uuid>` — the header go-ftw's markers carry —
-except a test that sends a raw request or asks for its headers exactly. An
+Each request carries `X-Regression-Case: <uuid>` — not go-ftw's `X-CRS-Test`,
+which CRS's test-marker rule answers by switching every rule off — except a
+test that sends a raw request or asks for its headers exactly. An
 access-log line is taken only if it names the method and path that were sent.
 waf.log records a request's headers when it blocked or would have blocked it;
 there the line must carry the same marker, and the case is recorded with
@@ -93,7 +94,10 @@ LOG_WAIT_SECS = 3.0
 # How long to wait for a request's waf.log line when one should exist. Lines
 # are written as the request completes; the readers poll every 50 ms.
 WAF_LOG_WAIT_SECS = 0.5
-MARKER = "X-CRS-Test"
+# Not go-ftw's `X-CRS-Test`: CRS's test-marker rule (CRS_ENABLE_TEST_MARKER,
+# id 999999) answers that header with ctl:ruleRemoveById=1-999999, so a
+# reference engine set up for go-ftw inspected NOTHING on a request carrying it.
+MARKER = "X-Regression-Case"
 
 
 # ---------------------------------------------------------------------------
