@@ -125,3 +125,17 @@ fn a_repeated_parameter_name_is_counted_as_one_name() {
     let ids = fired(&engine, make_get_ctx("/?pineapple=pizza&mango=pizza"), 3);
     assert!(!ids.iter().any(|id| id == "921180"), "{ids:?}");
 }
+
+/// 942190 test 42: `t:removeCommentsChar` deletes MySQL's `#` and `--` marks,
+/// which leaves `union` and `select` apart only by whitespace.
+#[test]
+fn remove_comments_char_deletes_what_modsecurity_deletes() {
+    let engine = load_crs_engine("REQUEST-942-APPLICATION-ATTACK-SQLI.conf");
+    for body in [
+        "id=@.:=right(right((select+user_login+from+wordpress.wp_users+limit+1,1),1111),1111)+union%23%0adistinctrow%0bselect@.",
+        "id=1+union--%0adistinctrow%0bselect+1",
+    ] {
+        let ids = fired(&engine, make_post_ctx("/get", body), 1);
+        assert!(ids.iter().any(|id| id == "942190"), "{body}: {ids:?}");
+    }
+}

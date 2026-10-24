@@ -4297,9 +4297,28 @@ fn normalise_path_transform(s: String) -> String {
     out
 }
 
-/// Strip C-style comment characters (`/*` and `*/`) from input.
+/// `t:removeCommentsChar`: delete the comment marks `/*`, `*/`, `<!--`, `-->`,
+/// `--` and `#`, in one pass left to right, as ModSecurity does (v2 and v3).
+/// This deleted `/*`, `*/` and `//`: not MySQL's `#` and `--` comments, so
+/// `union#\ndistinctrow\x0bselect` stayed apart for 942190 (CRS test 42,
+/// which the reference engine matches), and `//` is no mark in ModSecurity.
 fn remove_comments_char(s: String) -> String {
-    s.replace("/*", "").replace("*/", "").replace("//", "")
+    const MARKS: [&str; 6] = ["/*", "*/", "<!--", "-->", "--", "#"];
+    if !MARKS.iter().any(|m| s.contains(m)) {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(c) = rest.chars().next() {
+        match MARKS.iter().find(|m| rest.starts_with(**m)) {
+            Some(m) => rest = &rest[m.len()..],
+            None => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out
 }
 
 /// Remove SQL/C block comments (`/* ... */`) from input.
@@ -5884,7 +5903,7 @@ mod transform_tests {
             Transform::RemoveComments | Transform::ReplaceComments => {
                 vec![mb_of("/**/"), mb_of("x/**/"), mb_of("//**/*"), mb_of("/*")]
             }
-            Transform::RemoveCommentsChar => vec![mb_of("/**///")],
+            Transform::RemoveCommentsChar => vec![mb_of("/**/<!---->--#")],
             Transform::RemoveWhitespace | Transform::CompressWhitespace => {
                 vec![mb_of(" \t\n")]
             }
