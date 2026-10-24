@@ -138,18 +138,6 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-921-PROTOCOL-ATTACK/921180.yaml#4#0": {
-   "missing": [
-    921180
-   ],
-   "result": "fail"
-  },
-  "REQUEST-921-PROTOCOL-ATTACK/921180.yaml#6#0": {
-   "missing": [
-    921180
-   ],
-   "result": "fail"
-  },
   "REQUEST-921-PROTOCOL-ATTACK/921210.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -224,42 +212,6 @@
    "reason": "rule not loaded by the product",
    "result": "unsupported"
   },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933151.yaml#1#0": {
-   "missing": [
-    933151
-   ],
-   "result": "fail"
-  },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#16#0": {
-   "missing": [
-    933160
-   ],
-   "result": "fail"
-  },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#18#0": {
-   "missing": [
-    933160
-   ],
-   "result": "fail"
-  },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#21#0": {
-   "missing": [
-    933160
-   ],
-   "result": "fail"
-  },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#34#0": {
-   "missing": [
-    933160
-   ],
-   "result": "fail"
-  },
-  "REQUEST-933-APPLICATION-ATTACK-PHP/933160.yaml#37#0": {
-   "missing": [
-    933160
-   ],
-   "result": "fail"
-  },
   "REQUEST-933-APPLICATION-ATTACK-PHP/933200.yaml#5#0": {
    "reason": "rule not loaded by the product",
    "result": "unsupported"
@@ -279,36 +231,6 @@
   "REQUEST-934-APPLICATION-ATTACK-GENERIC/934101.yaml#4#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
-  },
-  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#23#0": {
-   "missing": [
-    934120
-   ],
-   "result": "fail"
-  },
-  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#24#0": {
-   "missing": [
-    934120
-   ],
-   "result": "fail"
-  },
-  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#25#0": {
-   "missing": [
-    934120
-   ],
-   "result": "fail"
-  },
-  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#26#0": {
-   "missing": [
-    934120
-   ],
-   "result": "fail"
-  },
-  "REQUEST-934-APPLICATION-ATTACK-GENERIC/934120.yaml#39#0": {
-   "missing": [
-    934120
-   ],
-   "result": "fail"
   },
   "REQUEST-934-APPLICATION-ATTACK-GENERIC/934130.yaml#7#0": {
    "reason": "no access-log line: rejected before the WAF",
@@ -334,12 +256,6 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-941-APPLICATION-ATTACK-XSS/941180.yaml#7#0": {
-   "result": "fail",
-   "unwanted": [
-    941180
-   ]
-  },
   "REQUEST-941-APPLICATION-ATTACK-XSS/941240.yaml#2#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -347,12 +263,6 @@
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942130.yaml#9#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942190.yaml#42#0": {
-   "missing": [
-    942190
-   ],
-   "result": "fail"
   },
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942500.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
@@ -365,12 +275,6 @@
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942521.yaml#16#0": {
    "reason": "the logs list only part of the rules that matched",
    "result": "unsupported"
-  },
-  "REQUEST-942-APPLICATION-ATTACK-SQLI/942522.yaml#7#0": {
-   "missing": [
-    942522
-   ],
-   "result": "fail"
   },
   "REQUEST-942-APPLICATION-ATTACK-SQLI/942522.yaml#8#0": {
    "reason": "the logs list only part of the rules that matched",
@@ -527,12 +431,6 @@
    "unwanted": [
     944120
    ]
-  },
-  "REQUEST-944-APPLICATION-ATTACK-JAVA/944200.yaml#1#0": {
-   "missing": [
-    944200
-   ],
-   "result": "fail"
   },
   "REQUEST-944-APPLICATION-ATTACK-JAVA/944210.yaml#23#0": {
    "result": "fail",
@@ -788,12 +686,12 @@
   }
  },
  "meta": {
-  "binary_sha256": "d879365f35fb3c6889c1d013f870f4f2c66c5d5ee4d2c9f70dcfeabe7d037899",
-  "commit": "389dc1fd620660f16affa977ec918e2cec3f98e0",
+  "binary_sha256": "98a168686bce9231bec5b44379bdd4f6f1e0686a9531915580329406df6d794c",
+  "commit": "30df6e824e752c0333b8f451c102ce28a6bab2c2",
   "config_sha256": "b452a2291b24ea33523828b54b2a79b0c9b0b9a3231967dd803a392c7a555839",
-  "engine": "sentinel-bin 389dc1f",
-  "runner_sha256": "4687d265736ab20d0b7a873cf0782911b73b6ca6b392e4ffc7453f9441490ca0",
-  "started_at": "2026-10-23T05:01:45+00:00",
+  "engine": "sentinel-bin 30df6e8",
+  "runner_sha256": "f13d190ae0cd6336187e06b5b24d2af53122c4072cfcef6a49f35d20be324531",
+  "started_at": "2026-10-24T09:50:33+00:00",
   "suite": {
    "crs_version": "4.7.0",
    "suite_sha256": "832c62d0508d7bc6e17b1dc4846c74ccbfec86958d8db15c5deb5dce2e26d09b"
