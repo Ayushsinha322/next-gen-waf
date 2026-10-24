@@ -69,14 +69,26 @@ pub(crate) async fn run<R>(len: usize, inspect: impl FnOnce() -> R) -> R {
     tokio::task::block_in_place(inspect)
 }
 
-/// The same for a caller that cannot wait for a slot — a WebSocket message is
-/// judged from a synchronous callback: off the worker, without the bound.
+/// The same for a synchronous caller — a WebSocket message is judged from a
+/// callback. It waits for its slot off the worker: inside `block_in_place` the
+/// thread is no worker any more, and may block on the semaphore.
+///
+/// This skipped the bound: heavy messages over many connections ran on as many
+/// threads at once, every core included, which is what the pool exists to
+/// prevent (external review 2026-10-22). The connection waiting for a slot
+/// waits with it, which is the backpressure it should get.
 pub(crate) fn run_now<R>(len: usize, inspect: impl FnOnce() -> R) -> R {
     if len < HEAVY_BYTES || !offload_possible() {
         return inspect();
     }
-    OFFLOADED.fetch_add(1, Ordering::Relaxed);
-    tokio::task::block_in_place(inspect)
+    tokio::task::block_in_place(|| {
+        WAITING.fetch_add(1, Ordering::Relaxed);
+        let permit = tokio::runtime::Handle::current().block_on(permits().acquire());
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+        let _permit = permit.expect("the inspection semaphore is never closed");
+        OFFLOADED.fetch_add(1, Ordering::Relaxed);
+        inspect()
+    })
 }
 
 /// For `/metrics`.
@@ -150,6 +162,52 @@ mod tests {
         let v = rt.block_on(run(10 * HEAVY_BYTES, || 7));
         assert_eq!(v, 7);
         assert_eq!(run_now(10 * HEAVY_BYTES, || 8), 8);
+    }
+
+    /// Heavy inspections from synchronous callers run at most `pool_size` at
+    /// once, as those from `run` do; and from `run` and `run_now` together.
+    #[test]
+    fn run_now_waits_for_a_slot_like_run() {
+        use std::sync::Arc;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let work = {
+            let (now, max) = (now.clone(), max.clone());
+            move || {
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                now.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+        let jobs = 2 * pool_size() + 4;
+        rt.block_on(async {
+            let tasks: Vec<_> = (0..jobs)
+                .map(|i| {
+                    let work = work.clone();
+                    tokio::spawn(async move {
+                        if i % 2 == 0 {
+                            run_now(HEAVY_BYTES, work);
+                        } else {
+                            run(HEAVY_BYTES, work).await;
+                        }
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+        });
+        let seen = max.load(Ordering::SeqCst);
+        assert!(
+            (1..=pool_size()).contains(&seen),
+            "{seen} heavy inspections ran at once; the pool allows {}",
+            pool_size()
+        );
     }
 
     #[test]
