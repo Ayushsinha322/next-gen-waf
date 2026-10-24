@@ -3144,30 +3144,85 @@ async fn serve_http1<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    serve_http1_with(
+        io,
+        peer,
+        tls,
+        hyper::service::service_fn(move |mut req: Request<Incoming>| {
+            if tls {
+                req.extensions_mut().insert(ClientTls);
+            }
+            let s = Arc::clone(&state);
+            let ds = default_site.clone();
+            let mgmt = management.clone();
+            let av = alt_svc.clone();
+            let fp = tls_fp.clone();
+            let resp =
+                panic_guard::contain_request(peer, handle_request(s, peer, req, ds, mgmt, fp));
+            async move { with_alt_svc(resp.await, av) }
+        }),
+    )
+    .await
+}
+
+/// Serve one HTTP/1 connection with `service`, noting each request hyper
+/// refuses itself (`note_refused`).
+async fn serve_http1_with<T, S>(
+    io: TokioIo<T>,
+    peer: SocketAddr,
+    tls: bool,
+    service: S,
+) -> anyhow::Result<()>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: hyper::service::HttpService<Incoming, ResBody = BoxBody>,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     hyper::server::conn::http1::Builder::new()
         // A timer must be configured for header_read_timeout to arm (hyper
         // panics at runtime otherwise).
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT)
-        .serve_connection(
-            io,
-            hyper::service::service_fn(move |mut req: Request<Incoming>| {
-                if tls {
-                    req.extensions_mut().insert(ClientTls);
-                }
-                let s = Arc::clone(&state);
-                let ds = default_site.clone();
-                let mgmt = management.clone();
-                let av = alt_svc.clone();
-                let fp = tls_fp.clone();
-                let resp =
-                    panic_guard::contain_request(peer, handle_request(s, peer, req, ds, mgmt, fp));
-                async move { with_alt_svc(resp.await, av) }
-            }),
-        )
+        .serve_connection(io, service)
         .with_upgrades()
         .await
-        .map_err(|e| anyhow!("http1 serve error: {e}"))
+        .map_err(|e| {
+            if e.is_parse() || e.is_parse_too_large() {
+                note_refused(peer, tls, &e);
+            }
+            anyhow!("http1 serve error: {e}")
+        })
+}
+
+/// HTTP/1 requests hyper refused before any reached `handle_request`.
+static HTTP_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// A request hyper refused itself — a request line or header it could not
+/// parse, or one past its size limits — and answered (400, 431, 501) before
+/// the WAF saw it. Not forwarded, so nothing got through; but it left no trace:
+/// the connection error went to a debug line, and a scanner sending malformed
+/// requests was invisible to the operator. 53 of CRS's regression requests
+/// end here. No Host or path was read, so there is no site to file it under:
+/// a log line and a counter are what there is.
+fn note_refused(peer: SocketAddr, tls: bool, e: &hyper::Error) {
+    HTTP_REFUSED.fetch_add(1, Ordering::Relaxed);
+    info!(
+        client_ip = %peer.ip(),
+        client_port = peer.port(),
+        tls,
+        reason = %e,
+        "request refused"
+    );
+}
+
+/// For `/metrics`.
+fn refused_metrics_text() -> String {
+    format!(
+        "# HELP sentinel_http_refused_total HTTP/1 requests refused before inspection as unparseable or over size limits\n\
+         # TYPE sentinel_http_refused_total counter\n\
+         sentinel_http_refused_total {}\n",
+        HTTP_REFUSED.load(Ordering::Relaxed)
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // per-connection state, as handle_connection
@@ -10898,6 +10953,7 @@ fn metrics_response(rate_limiter: &RateLimiter) -> Response<BoxBody> {
                 + &siem_metrics_text()
                 + &ip_feed::metrics_text()
                 + &inspect_pool::metrics_text()
+                + &refused_metrics_text()
                 + &rate_limiter.prometheus_text()
                 + &history_sink_metrics_text(
                     HISTORY_SINK_ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
@@ -17320,5 +17376,48 @@ mod management_routing_tests {
         assert!(!cp("/api/v1x"));
         assert!(!cp("/overview"));
         assert!(!cp("/_next/static/chunks/a.js"));
+    }
+}
+
+#[cfg(test)]
+mod http_refusal_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Send `raw` on one HTTP/1 connection and return the response's first line.
+    async fn exchange(raw: &[u8]) -> String {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = "198.51.100.20:4321".parse().unwrap();
+        let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+            Ok::<_, Infallible>(Response::new(full_body(Bytes::from_static(b"ok"))))
+        });
+        let served = tokio::spawn(serve_http1_with(TokioIo::new(server), peer, false, service));
+        let mut client = client;
+        client.write_all(raw).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut out)).await;
+        drop(client);
+        let _ = served.await;
+        String::from_utf8_lossy(&out)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A request hyper cannot parse is answered by hyper and counted; one it can
+    /// parse reaches the service and is not.
+    #[tokio::test]
+    async fn a_request_hyper_refuses_is_counted() {
+        let before = HTTP_REFUSED.load(Ordering::Relaxed);
+        let line = exchange(b"GET /a b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(line.starts_with("HTTP/1.1 400"), "{line:?}");
+        assert!(HTTP_REFUSED.load(Ordering::Relaxed) > before);
+        assert!(refused_metrics_text().contains("sentinel_http_refused_total "));
+
+        let before = HTTP_REFUSED.load(Ordering::Relaxed);
+        let line = exchange(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        assert!(line.starts_with("HTTP/1.1 200"), "{line:?}");
+        assert_eq!(HTTP_REFUSED.load(Ordering::Relaxed), before);
     }
 }
