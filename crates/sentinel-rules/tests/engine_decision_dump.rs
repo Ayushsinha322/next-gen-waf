@@ -9,6 +9,10 @@
 //! One line per (paranoia level, corpus line): `pl corpus file idx score ids`,
 //! with the fired rule IDs sorted. `ENGINE_DUMP_BENIGN_MAX` caps how many lines
 //! of the 1.3M-line benign corpus are read (default 200000).
+//!
+//! `ENGINE_DUMP_PLACEMENT` puts each line where it is sent from: `query` (the
+//! default, `GET /search?q=`), `xml` (the text of a `<q>` element in a
+//! pretty-printed SOAP envelope, POSTed as text/xml) or `json` (`{"q": …}`).
 
 mod common;
 
@@ -91,6 +95,7 @@ fn engine_decision_dump() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200_000);
+    let placement = std::env::var("ENGINE_DUMP_PLACEMENT").unwrap_or_else(|_| "query".into());
     let engine = full_engine();
     let mut w = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
     for (dir, max) in [
@@ -102,11 +107,7 @@ fn engine_decision_dump() {
         for pl in [1u8, 2] {
             for (file, lines) in &files {
                 for (i, l) in lines.iter().enumerate() {
-                    let q = percent_encoding::utf8_percent_encode(
-                        l,
-                        percent_encoding::NON_ALPHANUMERIC,
-                    );
-                    let mut ctx = make_get_ctx(&format!("/search?q={q}"));
+                    let mut ctx = request(&placement, l);
                     set_paranoia(&mut ctx, pl);
                     engine.evaluate(&mut ctx, Phase::RequestHeaders, 0);
                     engine.evaluate(&mut ctx, Phase::RequestBody, 0);
@@ -130,4 +131,40 @@ fn engine_decision_dump() {
     }
     w.flush().unwrap();
     println!("wrote {out}");
+}
+
+/// A request carrying `line` the way `placement` names.
+fn request(placement: &str, line: &str) -> sentinel_core::context::RequestContext {
+    let post = |content_type: &str, body: String| {
+        let mut ctx = make_post_ctx("/service", &body);
+        ctx.request_headers
+            .insert("content-type", content_type.parse().unwrap());
+        ctx
+    };
+    match placement {
+        "query" => {
+            let q = percent_encoding::utf8_percent_encode(line, percent_encoding::NON_ALPHANUMERIC);
+            make_get_ctx(&format!("/search?q={q}"))
+        }
+        "xml" => {
+            let text = line
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            post(
+                "text/xml; charset=utf-8",
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                     <soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n  \
+                     <soap:Body>\n    <Search xmlns=\"http://example.com/api\">\n      \
+                     <q>{text}</q>\n    </Search>\n  </soap:Body>\n</soap:Envelope>\n"
+                ),
+            )
+        }
+        "json" => post(
+            "application/json",
+            serde_json::json!({ "q": line }).to_string(),
+        ),
+        other => panic!("ENGINE_DUMP_PLACEMENT={other}: query, xml or json"),
+    }
 }
