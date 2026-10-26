@@ -2300,3 +2300,121 @@ async fn an_http_only_node_mints_no_site_certificates() {
         "an HTTP-only node wrote certificate files: {written:?}"
     );
 }
+
+// ============================================================================
+// Compressed request bodies
+// ============================================================================
+
+/// An origin that answers with the body it received, byte for byte.
+async fn start_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    use http_body_util::BodyExt;
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        http_body_util::Full::new(body),
+                    ))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// POST `body` as a form sent with `Content-Encoding: coding`.
+async fn send_encoded(listen_port: u16, coding: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
+        .await
+        .expect("connect to proxy");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/login")
+        .header(header::HOST, "test-site.local")
+        .header(
+            header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0",
+        )
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::CONTENT_ENCODING, coding)
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .unwrap();
+    let resp = sender.send_request(req).await.expect("send request");
+    let status = resp.status();
+    use http_body_util::BodyExt;
+    (status, resp.collect().await.unwrap().to_bytes().to_vec())
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+async fn compressed_body_proxy(
+    mode: WafMode,
+    max_body_size: u64,
+) -> (u16, impl FnOnce() -> tokio::task::JoinHandle<()>) {
+    let upstream = start_echo_upstream().await;
+    let listen_port = next_port();
+    let mut cfg = test_config(
+        listen_port,
+        upstream.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        mode,
+    );
+    cfg.sites[0].waf.max_body_size = max_body_size;
+    let (shutdown_tx, jh) = start_proxy(cfg).await;
+    (listen_port, move || {
+        tokio::spawn(async move { shutdown_proxy(shutdown_tx, jh).await })
+    })
+}
+
+/// A compressed attack passed: the rules read the gzip bytes, which match
+/// nothing, and the origin decompresses. It is inspected decoded now; a clean
+/// compressed body still reaches the origin exactly as it was sent.
+#[tokio::test]
+async fn a_compressed_body_is_inspected_decoded_and_forwarded_as_sent() {
+    let (port, stop) = compressed_body_proxy(WafMode::Blocking, 0).await;
+    let (status, _) = send_encoded(port, "gzip", gzip(b"user=admin' OR 1=1--&pass=foo")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "gzip SQLi");
+
+    let clean = gzip(b"user=alice&pass=correct-horse");
+    let (status, echoed) = send_encoded(port, "gzip", clean.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(echoed, clean, "the origin gets the body as sent");
+    stop().await.unwrap();
+}
+
+/// What cannot be decoded cannot be inspected: refused in blocking mode —
+/// 415 for a coding nothing here decodes, 413 for a body that inflates past
+/// the site's limit — and forwarded, recorded, in learning mode.
+#[tokio::test]
+async fn an_undecodable_body_is_refused_or_recorded_by_mode() {
+    let (port, stop) = compressed_body_proxy(WafMode::Blocking, 1 << 20).await;
+    let (status, _) = send_encoded(port, "compress", b"user=admin".to_vec()).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let bomb = gzip(&vec![b'a'; 10 << 20]);
+    let (status, _) = send_encoded(port, "gzip", bomb).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _) = send_encoded(port, "gzip", b"not gzip".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    stop().await.unwrap();
+
+    let (port, stop) = compressed_body_proxy(WafMode::Learning, 1 << 20).await;
+    let (status, echoed) = send_encoded(port, "compress", b"user=admin".to_vec()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(echoed, b"user=admin");
+    stop().await.unwrap();
+}

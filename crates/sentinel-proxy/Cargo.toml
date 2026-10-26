@@ -39,6 +39,12 @@ rustls-pemfile = { workspace = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
 # Public trust anchors for the SIEM feed when no private CA is configured.
 webpki-roots = "1"
+# Request bodies sent with a Content-Encoding are decoded for inspection
+# (src/content_coding.rs). flate2 and zstd are already in the build (sentinel-cli,
+# wasmtime's cache); brotli-decompressor is pure Rust and decodes only.
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }
+brotli-decompressor = "6"
 # HTTP/3 (QUIC transport + h3 protocol layer)
 quinn = { workspace = true }
 h3 = { workspace = true }

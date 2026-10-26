@@ -26,6 +26,7 @@
 mod acme_alpn_test;
 pub mod captcha;
 pub mod challenge;
+mod content_coding;
 mod cp_client;
 pub(crate) mod goodbot;
 pub mod http3;
@@ -4324,23 +4325,58 @@ async fn proxy_inner(
             }
         };
 
-        // Oversize under learning mode: forward untouched and skip every
-        // body-phase inspection. Loudly, because an uninspected request is a
-        // real coverage gap and must never be silent — the same rule the
-        // response side already follows for an oversize response.
+        // A body sent with a Content-Encoding is inspected decoded and
+        // forwarded as sent; one that cannot be decoded cannot be inspected,
+        // and is a body past the limit to the site's mode. See content_coding.
+        let mut decoded: Option<Bytes> = None;
+        let codings = content_coding::codings(&ctx.request_headers);
+        if forward_uninspected.is_none() && !codings.is_empty() && !bytes.is_empty() {
+            let limit = if max_bytes > 0 {
+                max_bytes as usize
+            } else {
+                content_coding::UNLIMITED_SITE_CAP
+            };
+            match inspect_pool::run(bytes.len(), || {
+                content_coding::decode(&codings, &bytes, limit)
+            })
+            .await
+            {
+                Ok(body) => decoded = Some(body),
+                Err(e) => {
+                    let (status, text) = e.status();
+                    if let Some(resp) =
+                        enforce_request_limit(ctx, site_ref, e.to_string(), status, text)
+                    {
+                        return Ok(resp);
+                    }
+                    forward_uninspected = Some(
+                        Full::new(bytes.clone())
+                            .map_err(|never: Infallible| match never {})
+                            .boxed(),
+                    );
+                }
+            }
+        }
+
+        // Oversize or undecodable under learning mode: forward untouched and
+        // skip every body-phase inspection. Loudly, because an uninspected
+        // request is a real coverage gap and must never be silent — the same
+        // rule the response side already follows for an oversize response.
         if let Some(passthrough) = forward_uninspected {
             warn!(
                 site = %site_ref.id,
                 limit_bytes = max_bytes,
-                "request body exceeds the limit — forwarded WITHOUT body inspection \
-                 (learning mode); recorded as would-block"
+                reason = ctx.block_reason.as_deref().unwrap_or(""),
+                "request body forwarded WITHOUT body inspection (learning mode); \
+                 recorded as would-block"
             );
             passthrough
         } else {
-            ctx.request_body = Some(bytes.clone());
+            let inspected = decoded.unwrap_or_else(|| bytes.clone());
+            ctx.request_body = Some(inspected.clone());
             // A large body is inspected off the async workers, so it cannot
             // delay every other site and the health probes (inspect_pool).
-            inspect_pool::run(bytes.len(), || {
+            inspect_pool::run(inspected.len(), || {
                 phase2_body(ctx, site, &engine_map, &state.ml_engine)
             })
             .await?;
@@ -4373,7 +4409,7 @@ async fn proxy_inner(
                             max_complexity: gql.max_complexity,
                             block_introspection: gql.block_introspection,
                         };
-                        if let Some(reason) = inspect_graphql(&bytes, &limits) {
+                        if let Some(reason) = inspect_graphql(&inspected, &limits) {
                             note_graphql_blocked();
                             ctx.decision = WafDecision::Block;
                             ctx.block_reason = Some(reason);
