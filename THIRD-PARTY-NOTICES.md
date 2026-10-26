@@ -9,8 +9,8 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**418 redistributed components** across Rust, Go, npm and container images.
-A further 105 Rust crates and 399 npm packages are
+**434 redistributed components** across Rust, Go, npm and container images.
+A further 114 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
 
@@ -28,10 +28,10 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 
 ## Rust crates (data plane)
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
-**280 components.**
+**297 components.**
 
-### MIT OR Apache-2.0 — 143 component(s)
-- ahash 0.8.12
+### MIT OR Apache-2.0 — 138 component(s)
+- allocator-api2 0.2.21
 - anstream 1.0.0
 - anstyle 1.0.14
 - anstyle-parse 1.0.0
@@ -40,7 +40,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - arbitrary 1.4.2
 - arc-swap 1.9.1
 - async-trait 0.1.89
-- base64 0.21.7
 - base64 0.22.1
 - bitflags 2.11.1
 - block-buffer 0.10.4
@@ -63,10 +62,11 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - crossbeam-epoch 0.9.21
 - crossbeam-utils 0.8.21
 - crypto-common 0.1.7
-- deranged 0.3.11
+- deranged 0.5.9
 - digest 0.10.7
 - directories-next 2.0.0
 - dirs-sys-next 0.1.2
+- displaydoc 0.2.7
 - either 1.15.0
 - errno 0.3.14
 - flate2 1.1.9
@@ -83,12 +83,10 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - fxprof-processed-profile 0.6.0
 - getrandom 0.2.17
 - getrandom 0.4.2
-- gimli 0.29.0
-- hashbrown 0.13.2
+- gimli 0.32.3
 - hashbrown 0.14.5
 - hashbrown 0.15.5
 - hashbrown 0.17.1
-- heck 0.4.1
 - heck 0.5.0
 - hex 0.4.3
 - hmac 0.12.1
@@ -96,27 +94,25 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - httparse 1.10.1
 - httpdate 1.0.3
 - iana-time-zone 0.1.65
-- idna 0.5.0
+- idna 1.1.0
 - ipnet 2.12.0
 - ipnetwork 0.20.0
 - is_terminal_polyfill 1.70.2
-- itertools 0.12.1
+- itertools 0.14.0
 - itoa 1.0.18
 - lazy_static 1.5.0
-- leb128 0.2.6
 - leb128fmt 0.1.0
 - libc 0.2.186
 - lock_api 0.4.14
 - log 0.4.29
 - memfd 0.6.5
 - num-bigint 0.4.8
-- num-conv 0.1.0
+- num-conv 0.2.2
 - num-integer 0.1.46
 - num-traits 0.2.19
 - once_cell 1.21.4
 - parking_lot 0.12.5
 - parking_lot_core 0.9.12
-- paste 1.0.15
 - percent-encoding 2.3.2
 - postcard 1.1.3
 - powerfmt 0.2.0
@@ -148,29 +144,28 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - signal-hook-registry 1.4.8
 - smallvec 1.15.1
 - socket2 0.6.3
-- sptr 0.3.2
+- stable_deref_trait 1.2.1
 - syn 2.0.117
+- syn 3.0.9
 - tar 0.4.45
 - thiserror 1.0.69
 - thiserror 2.0.18
 - thiserror-impl 1.0.69
 - thiserror-impl 2.0.18
 - thread_local 1.1.9
-- time 0.3.36
-- time-core 0.1.2
-- time-macros 0.2.18
+- time 0.3.55
+- time-core 0.1.9
+- time-macros 0.2.32
 - tokio-rustls 0.26.4
 - toml 0.8.23
 - toml_datetime 0.6.11
 - toml_edit 0.22.27
 - toml_write 0.1.2
 - typenum 1.20.0
-- unicode-bidi 0.3.18
-- unicode-normalization 0.1.25
 - unicode-width 0.2.2
 - unicode-xid 0.2.6
 - ureq 2.12.1
-- url 2.5.2
+- url 2.5.8
 - xattr 1.6.1
 - yasna 0.5.2
 - zstd-safe 7.2.4
@@ -197,8 +192,8 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - sharded-slab 0.1.7
 - simd-adler32 0.3.9
 - slab 0.4.12
-- slice-group-by 0.3.1
 - strsim 0.11.1
+- synstructure 0.14.0
 - tokio 1.52.3
 - tokio-macros 2.7.0
 - tokio-util 0.7.18
@@ -218,62 +213,93 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - zmij 1.0.21
 - zstd 0.13.3
 
-### Apache-2.0 WITH LLVM-exception — 25 component(s)
-- cranelift-bforest 0.111.13
-- cranelift-bitset 0.111.13
-- cranelift-codegen 0.111.13
-- cranelift-codegen-shared 0.111.13
-- cranelift-control 0.111.13
-- cranelift-entity 0.111.13
-- cranelift-frontend 0.111.13
-- cranelift-native 0.111.13
-- cranelift-wasm 0.111.13
-- regalloc2 0.9.3
-- target-lexicon 0.12.16
-- wasmtime 24.0.13
-- wasmtime-asm-macros 24.0.13
-- wasmtime-cache 24.0.13
-- wasmtime-component-macro 24.0.13
-- wasmtime-component-util 24.0.13
-- wasmtime-cranelift 24.0.13
-- wasmtime-environ 24.0.13
-- wasmtime-fiber 24.0.13
-- wasmtime-jit-debug 24.0.13
-- wasmtime-jit-icache-coherence 24.0.13
-- wasmtime-slab 24.0.13
-- wasmtime-types 24.0.13
-- wasmtime-versioned-export-macros 24.0.13
-- wasmtime-wit-bindgen 24.0.13
+### Apache-2.0 WITH LLVM-exception — 28 component(s)
+- cranelift-assembler-x64 0.123.19
+- cranelift-bforest 0.123.19
+- cranelift-bitset 0.123.19
+- cranelift-codegen 0.123.19
+- cranelift-codegen-shared 0.123.19
+- cranelift-control 0.123.19
+- cranelift-entity 0.123.19
+- cranelift-frontend 0.123.19
+- cranelift-native 0.123.19
+- pulley-interpreter 36.0.19
+- pulley-macros 36.0.19
+- regalloc2 0.12.2
+- target-lexicon 0.13.5
+- wasmtime 36.0.19
+- wasmtime-environ 36.0.19
+- wasmtime-internal-asm-macros 36.0.19
+- wasmtime-internal-cache 36.0.19
+- wasmtime-internal-component-macro 36.0.19
+- wasmtime-internal-component-util 36.0.19
+- wasmtime-internal-cranelift 36.0.19
+- wasmtime-internal-fiber 36.0.19
+- wasmtime-internal-jit-debug 36.0.19
+- wasmtime-internal-jit-icache-coherence 36.0.19
+- wasmtime-internal-math 36.0.19
+- wasmtime-internal-slab 36.0.19
+- wasmtime-internal-unwinder 36.0.19
+- wasmtime-internal-versioned-export-macros 36.0.19
+- wasmtime-internal-wit-bindgen 36.0.19
 
-### Apache-2.0 OR MIT — 15 component(s)
-- addr2line 0.22.0
+### Unicode-3.0 — 18 component(s)
+- icu_collections 2.4.0
+- icu_locale_core 2.4.0
+- icu_normalizer 2.4.0
+- icu_normalizer_data 2.4.0
+- icu_properties 2.4.0
+- icu_properties_data 2.4.0
+- icu_provider 2.4.0
+- litemap 0.8.3
+- potential_utf 0.1.6
+- tinystr 0.8.5
+- writeable 0.6.4
+- yoke 0.8.4
+- yoke-derive 0.8.4
+- zerofrom 0.1.8
+- zerofrom-derive 0.1.8
+- zerotrie 0.2.5
+- zerovec 0.11.9
+- zerovec-derive 0.11.7
+
+### Apache-2.0 OR MIT — 17 component(s)
+- addr2line 0.25.1
 - async-lock 3.4.2
 - atomic-waker 1.1.2
 - equivalent 1.0.2
 - event-listener 5.4.2
 - event-listener-strategy 0.5.4
 - fastrand 2.4.1
+- idna_adapter 1.2.2
 - indexmap 2.14.0
-- object 0.36.7
+- object 0.37.3
 - parking 2.2.1
 - pin-project-lite 0.2.17
 - rustc-hash 2.1.2
+- utf8_iter 1.0.4
 - utf8parse 0.2.2
 - uuid 1.23.1
 - zeroize 1.8.2
 
-### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT — 11 component(s)
+### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT — 9 component(s)
 - linux-raw-sys 0.12.1
-- linux-raw-sys 0.4.15
-- rustix 0.38.44
 - rustix 1.1.4
-- wasm-encoder 0.215.0
+- wasm-encoder 0.236.1
 - wasm-encoder 0.248.0
-- wasmparser 0.215.0
-- wasmprinter 0.215.0
+- wasmparser 0.236.1
+- wasmprinter 0.236.1
 - wast 248.0.0
 - wat 1.248.0
-- wit-parser 0.215.0
+- wit-parser 0.236.1
+
+### BSD-3-Clause — 6 component(s)
+- alloc-no-stdlib 3.0.0
+- alloc-stdlib 0.3.0
+- libinjectionrs 0.1.1
+- redis 1.2.2
+- sha1_smol 1.0.1
+- subtle 2.6.1
 
 ### MIT/Apache-2.0 — 6 component(s)
 - filetime 0.2.28
@@ -283,15 +309,9 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - symlink 0.1.0
 - zstd-sys 2.0.16+zstd.1.5.7
 
-### BSD-3-Clause — 4 component(s)
-- libinjectionrs 0.1.1
-- redis 1.2.2
-- sha1_smol 1.0.1
-- subtle 2.6.1
-
 ### ISC — 4 component(s)
 - maxminddb 0.24.0
-- rustls-webpki 0.103.15
+- rustls-webpki 0.103.16
 - simple_asn1 0.6.3
 - untrusted 0.9.0
 
@@ -310,13 +330,9 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - backon 1.6.0
 - debugid 0.8.0
 
-### Apache-2.0/MIT — 2 component(s)
-- fxhash 0.2.1
-- rustc-hash 1.1.0
-
 ### CDLA-Permissive-2.0 — 2 component(s)
 - webpki-roots 0.26.11
-- webpki-roots 1.0.7
+- webpki-roots 1.0.10
 
 ### GPL-2.0-only OR BSD-3-Clause — 2 component(s)
 - ittapi 0.4.0
@@ -347,8 +363,11 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 ### Apache-2.0 OR MIT OR Zlib — 1 component(s)
 - arcstr 1.2.0
 
-### BSD-2-Clause OR Apache-2.0 OR MIT — 1 component(s)
-- zerocopy 0.8.48
+### Apache-2.0/MIT — 1 component(s)
+- fxhash 0.2.1
+
+### BSD-3-Clause/MIT — 1 component(s)
+- brotli-decompressor 6.2.0
 
 ### BSL-1.0 — 1 component(s)
 - xxhash-rust 0.8.19
@@ -431,16 +450,15 @@ In the `controllerd` module graph. Go modules carry no licence field in the grap
 
 ## npm packages (dashboard, production)
 Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset of these into the shipped client.
-**76 components.**
+**75 components.**
 
-### MIT — 48 component(s)
+### MIT — 47 component(s)
 - @babel/runtime 7.27.0
 - @babel/runtime 7.29.7
 - @emnapi/runtime 1.11.3
 - @img/colour 1.1.0
-- @next/env 15.5.27
-- @next/swc-linux-x64-gnu 15.5.27
-- @next/swc-linux-x64-musl 15.5.27
+- @next/env 15.5.28
+- @next/swc-linux-x64-gnu 15.5.28
 - @tanstack/query-core 5.100.10
 - @tanstack/react-query 5.100.10
 - @types/d3-array 3.2.2
@@ -467,7 +485,7 @@ Production dependencies only — `npm ls --omit=dev`. Next.js bundles a subset o
 - motion-dom 12.40.0
 - motion-utils 12.39.0
 - nanoid 3.3.19
-- next 15.5.27
+- next 15.5.28
 - object-assign 4.1.1
 - postcss 8.5.28
 - prop-types 15.8.1
@@ -572,9 +590,9 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 
 ## Rust (dev- and build-dependencies)
 
-**105 components.**
+**114 components.**
 
-### MIT OR Apache-2.0 — 49 component(s)
+### MIT OR Apache-2.0 — 57 component(s)
 - anes 0.1.6
 - anstyle-wincon 3.0.11
 - cast 0.3.0
@@ -594,9 +612,7 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - once_cell_polyfill 1.70.2
 - pkg-config 0.3.33
 - prettyplease 0.2.37
-- psm 0.1.31
 - shlex 1.3.0
-- stable_deref_trait 1.2.1
 - system-configuration 0.7.0
 - system-configuration-sys 0.6.0
 - tempfile 3.27.0
@@ -614,16 +630,26 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - windows-result 0.4.1
 - windows-strings 0.5.1
 - windows-sys 0.52.0
+- windows-sys 0.60.2
 - windows-sys 0.61.2
 - windows-targets 0.52.6
+- windows-targets 0.53.5
 - windows_aarch64_gnullvm 0.52.6
+- windows_aarch64_gnullvm 0.53.1
 - windows_aarch64_msvc 0.52.6
+- windows_aarch64_msvc 0.53.1
 - windows_i686_gnu 0.52.6
+- windows_i686_gnu 0.53.1
 - windows_i686_gnullvm 0.52.6
+- windows_i686_gnullvm 0.53.1
 - windows_i686_msvc 0.52.6
+- windows_i686_msvc 0.53.1
 - windows_x86_64_gnu 0.52.6
+- windows_x86_64_gnu 0.53.1
 - windows_x86_64_gnullvm 0.52.6
+- windows_x86_64_gnullvm 0.53.1
 - windows_x86_64_msvc 0.52.6
+- windows_x86_64_msvc 0.53.1
 
 ### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT — 14 component(s)
 - wasi 0.11.1+wasi-snapshot-preview1
@@ -667,23 +693,27 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - winapi-i686-pc-windows-gnu 0.4.0
 - winapi-x86_64-pc-windows-gnu 0.4.0
 
-### Apache-2.0 WITH LLVM-exception — 5 component(s)
-- ar_archive_writer 0.5.1
-- cranelift-codegen-meta 0.111.13
-- cranelift-isle 0.111.13
-- wasmtime-winch 24.0.13
-- winch-codegen 0.22.13
-
-### Apache-2.0 OR MIT — 4 component(s)
-- autocfg 1.5.0
-- criterion 0.5.1
-- object 0.37.3
-- tinytemplate 1.2.1
+### Apache-2.0 WITH LLVM-exception — 6 component(s)
+- cranelift-assembler-x64-meta 0.123.19
+- cranelift-codegen-meta 0.123.19
+- cranelift-isle 0.123.19
+- cranelift-srcgen 0.123.19
+- wasmtime-internal-winch 36.0.19
+- winch-codegen 36.0.19
 
 ### Apache-2.0 — 3 component(s)
 - ciborium 0.2.2
 - ciborium-io 0.2.2
 - ciborium-ll 0.2.2
+
+### Apache-2.0 OR MIT — 3 component(s)
+- autocfg 1.5.0
+- criterion 0.5.1
+- tinytemplate 1.2.1
+
+### BSD-2-Clause OR Apache-2.0 OR MIT — 2 component(s)
+- zerocopy 0.8.48
+- zerocopy-derive 0.8.48
 
 ### MIT OR Apache-2.0 OR LGPL-2.1-or-later — 2 component(s)
 - r-efi 5.3.0
@@ -692,9 +722,6 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 ### Unlicense/MIT — 2 component(s)
 - same-file 1.0.6
 - walkdir 2.5.0
-
-### BSD-2-Clause OR Apache-2.0 OR MIT — 1 component(s)
-- zerocopy-derive 0.8.48
 
 ### BSD-2-Clause OR MIT OR Apache-2.0 — 1 component(s)
 - mach2 0.4.3
