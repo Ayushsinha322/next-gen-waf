@@ -16,7 +16,8 @@ name: ci
 #   Go   1.26.10     .gitlab-ci.yml  go          image: golang:1.26.10, the
 #                    `toolchain` line in control-plane/go.mod and both
 #                    golang stages of deploy/docker/Dockerfile
-#   Node 22          .gitlab-ci.yml  dashboard   image: node:22
+#   Node 22.23.4     .gitlab-ci.yml  dashboard   image: node:22.23.4, and the three
+#                    node stages of deploy/docker/Dockerfile.dashboard
 #
 # Runners are pinned to ubuntu-24.04 rather than ubuntu-latest, which moves to
 # Ubuntu 26 from 2026-10-19; a runner upgrade should be a commit, not a surprise.
@@ -130,7 +131,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "22.23.4"
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci

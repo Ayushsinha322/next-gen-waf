@@ -219,7 +219,7 @@ go:
 # allow_failure with `|| true` on every step — i.e. it could never fail.)
 dashboard:
   stage: test
-  image: node:22
+  image: node:22.23.4
   tags:
     - k8s-docker
   cache:
