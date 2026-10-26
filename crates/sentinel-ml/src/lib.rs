@@ -272,14 +272,23 @@ impl MlEngine {
                     // ordinary basket update — while every field in it scored
                     // under 0.01. When the body parses, each field and key is
                     // already a candidate; a body that does not parse (malformed
-                    // JSON, XML, an unknown type) is still scored whole — for the
-                    // veto only when it is binary, see `looks_binary`.
+                    // JSON, malformed XML, an unknown type) is still scored whole
+                    // — for the veto only when it is binary, see `looks_binary`.
+                    //
+                    // An XML body that parses is scored by its values too (see
+                    // `xml_values`), and whole for the veto only: whole, its
+                    // markup alone scored as an attack, and every SOAP envelope,
+                    // order or feed on a site with ML on was blocked by the
+                    // classifier with no rule involved (measured 2026-10-26: five
+                    // benign documents, 403 each, score 12-14, ML-ANOMALY only).
                     if !body_field_values(bs, ct, &mut candidates) {
                         if looks_binary(bs) {
                             veto_only.push(bs.to_string());
                         } else {
                             candidates.push(bs.to_string());
                         }
+                    } else if is_xml(ct) {
+                        veto_only.push(bs.to_string());
                     }
                 }
             }
@@ -427,6 +436,219 @@ impl MlEngine {
 ///
 /// Keys are pushed too: a payload can be carried in a field NAME, and the rule
 /// engine inspects ARGS_NAMES for exactly that reason.
+/// XML and SOAP content types, as the rule engine names them.
+fn is_xml(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    ct.starts_with("text/xml")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/soap+xml")
+        || ct.contains("+xml")
+}
+
+/// Pushes the values of an XML body — text, CDATA, attribute values other than
+/// namespace declarations. Element and attribute names are not values: an XML
+/// Name cannot carry an injection's punctuation (as in the rule engine).
+///
+/// Returns false, pushing nothing, so the caller scores the document whole as
+/// before, when it does not parse, or when its markup is itself the attack
+/// surface — markup that makes a parser fetch or expand something: a DOCTYPE or
+/// entity declaration (XXE), XInclude or an XSD include/import/redefine, a
+/// `schemaLocation`, an encoding other than the usual ones (UTF-7 hides a
+/// DOCTYPE from every text match), or a processing instruction other than the
+/// declaration and a stylesheet. Those were caught only because the whole
+/// document was scored, and no rule catches them (GoTestWAF community-xxe and
+/// xml-injection); a plain data document — a SOAP call, an order, a feed — has
+/// none of them.
+fn xml_values(body: &str, out: &mut Vec<String>) -> bool {
+    let mut found = Vec::new();
+    // Open elements: a document whose elements do not close, in order, does
+    // not parse.
+    let mut open: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < body.len() {
+        let rest = &body[i..];
+        if !rest.starts_with('<') {
+            let end = rest.find('<').unwrap_or(rest.len());
+            let text = rest[..end].trim();
+            if !text.is_empty() {
+                found.push(xml_unescape(text));
+            }
+            i += end;
+            continue;
+        }
+        let consumed = if rest.starts_with("<!--") {
+            rest.find("-->").map(|e| e + 3)
+        } else if let Some(cdata) = rest.strip_prefix("<![CDATA[") {
+            cdata.find("]]>").map(|e| {
+                if !cdata[..e].trim().is_empty() {
+                    found.push(cdata[..e].to_owned());
+                }
+                9 + e + 3
+            })
+        } else if rest.starts_with("<!") {
+            // DOCTYPE or a declaration: the markup is the attack surface.
+            return false;
+        } else if rest.starts_with("<?") {
+            let Some(e) = rest.find("?>") else {
+                return false;
+            };
+            let pi = &rest[..e + 2];
+            let declaration = pi.starts_with("<?xml ") || pi.starts_with("<?xml?");
+            if !(declaration && usual_encoding(pi) || pi.starts_with("<?xml-stylesheet")) {
+                return false;
+            }
+            Some(e + 2)
+        } else {
+            let Some(e) = tag_end(rest) else {
+                return false;
+            };
+            let tag = &rest[1..e];
+            if fetches_or_expands(tag) {
+                return false;
+            }
+            let name = tag
+                .trim_start_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let name = name.trim_end_matches('/');
+            if tag.starts_with('/') {
+                if open.pop() != Some(name) {
+                    return false;
+                }
+            } else if !tag.ends_with('/') {
+                open.push(name);
+            }
+            xml_attribute_values(tag, &mut found);
+            Some(e + 1)
+        };
+        match consumed {
+            Some(n) => i += n,
+            None => return false,
+        }
+    }
+    if !open.is_empty() {
+        return false;
+    }
+    out.extend(found);
+    true
+}
+
+/// An XML declaration naming no encoding, or one of the encodings documents
+/// are written in; UTF-7 and its kind turn markup into text no rule reads.
+fn usual_encoding(declaration: &str) -> bool {
+    let lower = declaration.to_ascii_lowercase();
+    let Some(at) = lower.find("encoding") else {
+        return true;
+    };
+    let value = lower[at + 8..]
+        .trim_start_matches([' ', '='])
+        .trim_start_matches(['"', '\''])
+        .split(['"', '\'', ' ', '?'])
+        .next()
+        .unwrap_or("");
+    matches!(
+        value,
+        "utf-8" | "utf8" | "us-ascii" | "ascii" | "iso-8859-1" | "latin1" | "windows-1252"
+    )
+}
+
+/// A tag that makes a parser fetch or expand something: XInclude, an XSD
+/// include/import/redefine/override, or a `schemaLocation` attribute.
+fn fetches_or_expands(tag: &str) -> bool {
+    let name = tag
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    let local = name.rsplit(':').next().unwrap_or(name).to_ascii_lowercase();
+    let lower = tag.to_ascii_lowercase();
+    matches!(
+        local.as_str(),
+        "include" | "import" | "redefine" | "override"
+    ) || lower.contains("schemalocation")
+        || lower.contains("2001/xinclude")
+}
+
+/// Where the tag at the start of `s` ends: its `>` outside quoted values.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in s.char_indices().skip(1) {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '>') => return Some(i),
+            (None, '<') => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The quoted attribute values of a tag's inside (`name a="1" b='2' /`).
+fn xml_attribute_values(tag: &str, out: &mut Vec<String>) {
+    let mut rest = tag;
+    while let Some(eq) = rest.find('=') {
+        let name = rest[..eq].split_whitespace().last().unwrap_or("");
+        let after = rest[eq + 1..].trim_start();
+        let Some(q) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            rest = after;
+            continue;
+        };
+        let Some(close) = after[1..].find(q) else {
+            return;
+        };
+        let value = &after[1..1 + close];
+        let namespace = name == "xmlns" || name.starts_with("xmlns:");
+        if !namespace && !value.trim().is_empty() {
+            out.push(xml_unescape(value));
+        }
+        rest = &after[1 + close + 1..];
+    }
+}
+
+/// The five predefined entities and numeric character references.
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let decoded = tail.find(';').filter(|&semi| semi <= 12).and_then(|semi| {
+            let c = match &tail[1..semi] {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                n => n.strip_prefix('#').and_then(|n| {
+                    match n.strip_prefix(['x', 'X']) {
+                        Some(h) => u32::from_str_radix(h, 16).ok(),
+                        None => n.parse().ok(),
+                    }
+                    .and_then(char::from_u32)
+                }),
+            };
+            c.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn json_scalar_values(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::Object(map) => {
@@ -589,6 +811,8 @@ fn body_field_values(body: &str, content_type: &str, out: &mut Vec<String>) -> b
             }
             Err(_) => false,
         }
+    } else if is_xml(&ct) {
+        xml_values(body, out)
     } else if let Some(pos) = ct.find("multipart/form-data") {
         // Boundary token from `; boundary=...`.
         let Some(b) = ct[pos..]
@@ -1020,5 +1244,59 @@ mod json_candidate_tests {
         let junk = part(&"filename=".repeat(125)).repeat(900);
         let body = format!("{junk}{}--B--", part(&format!("name=\"f\"; {attack}")));
         assert!(fragment_kept(&body), "lost after 900 junk parts");
+    }
+}
+
+#[cfg(test)]
+mod xml_candidate_tests {
+    use super::{body_field_values, xml_values};
+
+    fn values(body: &str) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        xml_values(body, &mut out).then_some(out)
+    }
+
+    /// A data document is scored by its values: whole, its markup alone scored
+    /// as an attack, and every SOAP call on a site with ML on was blocked.
+    #[test]
+    fn a_data_document_is_scored_by_its_values() {
+        let soap = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<soap:Envelope \
+            xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\n  <soap:Body>\n    \
+            <GetQuote xmlns=\"http://example.com/stock\"><symbol>INFY</symbol>\
+            <note><![CDATA[after 6pm]]></note><qty unit=\"pcs\">2</qty></GetQuote>\n  \
+            </soap:Body>\n</soap:Envelope>\n";
+        assert_eq!(values(soap).unwrap(), ["INFY", "after 6pm", "pcs", "2"]);
+        let mut out = Vec::new();
+        assert!(body_field_values(soap, "text/xml; charset=utf-8", &mut out));
+        // An attack in a value is still a value.
+        assert_eq!(
+            values("<login><user>admin&apos; OR 1=1--</user></login>").unwrap(),
+            ["admin' OR 1=1--"]
+        );
+    }
+
+    /// Markup that makes a parser fetch or expand something is the attack
+    /// surface: such a document is scored whole (GoTestWAF community-xxe and
+    /// xml-injection were caught that way and by nothing else).
+    #[test]
+    fn markup_that_fetches_or_expands_keeps_the_document_whole() {
+        for doc in [
+            "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"http://x/\">]><foo>&xxe;</foo>",
+            "<?xml version=\"1.0\" encoding=\"UTF-7\"?>\n+ADwAIQ-DOCTYPE foo+AFs-",
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:include namespace=\"http://x/\"/></xs:schema>",
+            "<x xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://x/\"/>",
+            "<a xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"file:///etc/passwd\"/></a>",
+            "<?php system('id'); ?><a/>",
+            // Malformed: as before, scored whole.
+            "<a>unterminated",
+            "<a b=\"1\" <c>",
+        ] {
+            assert_eq!(values(doc), None, "{doc}");
+        }
+        // A stylesheet instruction and a usual encoding are ordinary.
+        assert!(values(
+            "<?xml version='1.0' encoding='ISO-8859-1'?><?xml-stylesheet href='a.xsl'?><a>x</a>"
+        )
+        .is_some());
     }
 }
