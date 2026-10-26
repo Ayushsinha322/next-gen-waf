@@ -36,3 +36,5 @@ fb1a3a870e138cc474c19e8b480aecbd55db3d88:crates/sentinel-proxy/src/lib.rs:generi
 7d270d0096ce3e2bc8afdae09b3a03083fa09fb8:deploy/SITE-ONBOARDING-CHECKLIST.md:generic-api-key:187
 # RFC 6455 sample Sec-WebSocket-Key (dGhlIHNhbXBsZSBub25jZQ==)
 b62377829c0a1c823b2252677fb3eda72f91b7bd:deploy/manual/TROUBLESHOOTING.md:generic-api-key:323
+# OWASP CRS 4.7.0 regression suite (vendored, one line): three HS256 sample JWTs in the test agent's requests
+407b07e9fde9c432280f2ff38a3b721a4afe7909:rules/owasp-crs/tests/regression-4.7.0.json:jwt:1
