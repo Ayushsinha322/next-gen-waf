@@ -4326,9 +4326,14 @@ async fn proxy_inner(
         };
 
         // A body sent with a Content-Encoding is inspected decoded and
-        // forwarded as sent; one that cannot be decoded cannot be inspected,
-        // and is a body past the limit to the site's mode. See content_coding.
+        // forwarded as sent. One that cannot be decoded was not inspected as
+        // the origin will read it, and is a body past the limit to the site's
+        // mode. A stream that is not valid in the coding it names, though, is
+        // most likely not encoded at all, so it is inspected as it arrived
+        // first: an attack sent under a Content-Encoding it does not have is
+        // still answered, and logged, as an attack. See content_coding.
         let mut decoded: Option<Bytes> = None;
+        let mut undecodable: Option<content_coding::Undecodable> = None;
         let codings = content_coding::codings(&ctx.request_headers);
         if forward_uninspected.is_none() && !codings.is_empty() && !bytes.is_empty() {
             let limit = if max_bytes > 0 {
@@ -4342,6 +4347,7 @@ async fn proxy_inner(
             .await
             {
                 Ok(body) => decoded = Some(body),
+                Err(e @ content_coding::Undecodable::Corrupt(_)) => undecodable = Some(e),
                 Err(e) => {
                     let (status, text) = e.status();
                     if let Some(resp) =
@@ -4483,6 +4489,17 @@ async fn proxy_inner(
                 ctx.advance_phase(Phase::Logging);
                 log_request(ctx);
                 return Ok(resp);
+            }
+
+            // Nothing in the body as it arrived was an attack; what the origin
+            // will decode from it could not be inspected.
+            if let Some(e) = undecodable {
+                let (status, text) = e.status();
+                if let Some(resp) =
+                    enforce_request_limit(ctx, site_ref, e.to_string(), status, text)
+                {
+                    return Ok(resp);
+                }
             }
 
             Full::new(bytes)

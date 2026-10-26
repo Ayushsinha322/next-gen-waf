@@ -15,9 +15,12 @@
 //! inflate to gigabytes are refused, not inflated.
 //!
 //! A body that cannot be decoded — a coding this does not know (`compress`,
-//! anything new), a corrupt stream, or one that inflates past the limit —
-//! cannot be inspected, and is handled as a body past the limit is: refused
-//! in blocking mode, forwarded and recorded as a would-block in learning mode.
+//! anything new), a corrupt stream, or one that inflates past the limit — was
+//! not inspected as the origin will read it, and is handled as a body past the
+//! limit is: refused in blocking mode, forwarded and recorded as a would-block
+//! in learning mode. A corrupt stream is most likely not encoded at all, so it
+//! is inspected as it arrived first: an attack sent under a Content-Encoding it
+//! does not have is still answered, and logged, as an attack.
 
 use std::fmt;
 use std::io::Read;

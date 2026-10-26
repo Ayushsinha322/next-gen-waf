@@ -2410,6 +2410,10 @@ async fn an_undecodable_body_is_refused_or_recorded_by_mode() {
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     let (status, _) = send_encoded(port, "gzip", b"not gzip".to_vec()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Not what it says it is, but inspected as it arrived: an attack is an
+    // attack (GoTestWAF's raw RCE requests carry a stray Content-Encoding).
+    let (status, _) = send_encoded(port, "gzip", b"user=admin' OR 1=1--&pass=foo".to_vec()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     stop().await.unwrap();
 
     let (port, stop) = compressed_body_proxy(WafMode::Learning, 1 << 20).await;
