@@ -23,6 +23,20 @@ stages:
   - security
   - publish     # tags only — build the four images and push them to Harbor
 
+# Which runner the test and build jobs run on (`tags: [$RUNNER_TAG]`).
+#
+# k8s-docker is runner #45, the Kubernetes executor on 172.16.23.48 these jobs
+# were written for (the disk notes below are about its node). It has been
+# offline since 2026-10-24 18:09 UTC and did not reconnect when GitLab came
+# back, so every pipeline sat pending until GitLab failed its jobs as
+# stuck_or_timeout_failure without running them. Until it returns they run on
+# ai-docs — runner #51, the Docker executor on a shared host (475 GB free) that
+# publish-images and release already use. Set this back to k8s-docker once #45
+# is online again; a single pipeline can also be pointed at either runner by
+# setting RUNNER_TAG when it is started.
+variables:
+  RUNNER_TAG: "ai-docs"
+
 # ── Rust data plane ──────────────────────────────────────────────────────────
 # Shared Rust CI settings.
 #
@@ -51,7 +65,7 @@ stages:
   # The exact release (as with Go): 1.88.0, the toolchain wasmtime 36 LTS needs.
   image: rust:1.88.0
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
     # No debug info in CI — see above.
@@ -169,7 +183,7 @@ crs-regression:
   stage: security
   image: python:3.12-slim-bookworm
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
   needs: [rust-build]
   timeout: 30m
   script:
@@ -193,7 +207,7 @@ go:
   # deploy/docker/Dockerfile, control-plane/go.mod and .github/workflows/ci.yml.
   image: golang:1.26.10
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
   cache:
     key: "go-$CI_COMMIT_REF_SLUG"
     paths:
@@ -221,7 +235,7 @@ dashboard:
   stage: test
   image: node:22.23.4
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
   cache:
     key: "node-$CI_COMMIT_REF_SLUG"
     paths:
@@ -254,7 +268,7 @@ deploy-shell:
   stage: test
   image: alpine:3.20
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
   before_script:
     # docker-cli-compose is here for check-compose-parses-clean.sh. `docker
     # compose config` only parses and interpolates — it never contacts a daemon —
@@ -357,7 +371,7 @@ include:
 
 secret_detection:
   tags:
-    - k8s-docker
+    - $RUNNER_TAG
 
 # ── Container images → Harbor ────────────────────────────────────────────────
 # Builds the four product images and pushes them to the ESDS Harbor registry, so
