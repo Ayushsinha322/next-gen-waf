@@ -2422,3 +2422,173 @@ async fn an_undecodable_body_is_refused_or_recorded_by_mode() {
     assert_eq!(echoed, b"user=admin");
     stop().await.unwrap();
 }
+
+// ============================================================================
+// Policy lists versus the classifier's veto
+// ============================================================================
+
+/// An origin that counts the requests it is sent.
+async fn start_counting_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |_req: Request<Incoming>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(bytes::Bytes::from_static(b"origin")),
+                        ))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (addr, hits)
+}
+
+/// One request with exactly the headers given, plus Host and a browser UA.
+async fn send_with_headers(
+    listen_port: u16,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> StatusCode {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
+        .await
+        .expect("connect to proxy");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, "test-site.local")
+        .header(
+            header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0",
+        )
+        .header(header::ACCEPT, "text/html");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let req = req
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            body.to_string(),
+        )))
+        .unwrap();
+    let resp = sender.send_request(req).await.expect("send request");
+    let status = resp.status();
+    use http_body_util::BodyExt;
+    let _ = resp.collect().await;
+    status
+}
+
+/// An operator's policy list is enforced whether the classifier is on or not.
+///
+/// With CRS's own lists set and its threshold of 5, the classifier's veto
+/// ("the text looks benign") passed a restricted extension, a restricted
+/// header and a forbidden content type to the origin; with the classifier off
+/// all three were refused (external review, 2026-10-27). Checked at the
+/// origin, not only by status: a refused request must never arrive there.
+#[tokio::test]
+async fn policy_list_violations_are_refused_with_or_without_the_classifier() {
+    for ml in [false, true] {
+        let (upstream, hits) = start_counting_upstream().await;
+        let listen_port = next_port();
+        let mut cfg = test_config(
+            listen_port,
+            upstream.port(),
+            "REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+            WafMode::Blocking,
+        );
+        let waf = &mut cfg.sites[0].waf;
+        waf.rules = [
+            "REQUEST-911-METHOD-ENFORCEMENT.conf",
+            "REQUEST-920-PROTOCOL-ENFORCEMENT.conf",
+            "REQUEST-922-MULTIPART-ATTACK.conf",
+        ]
+        .iter()
+        .map(|f| crs_rule_dir().join(f).to_string_lossy().into_owned())
+        .collect();
+        waf.paranoia_level = 1;
+        waf.anomaly_threshold = 5;
+        // CRS's example values (crs-setup.conf.example).
+        waf.crs_policy = [
+            ("restricted_extensions", ".bak/ .conf/ .sql/ .old/"),
+            (
+                "restricted_headers_basic",
+                "/content-encoding/ /proxy/ /lock-token/ /content-range/ /if/ \
+                 /x-http-method-override/ /x-http-method/ /x-method-override/",
+            ),
+            (
+                "allowed_request_content_type",
+                "|application/x-www-form-urlencoded| |multipart/form-data| \
+                 |multipart/related| |text/xml| |application/xml| \
+                 |application/soap+xml| |application/json|",
+            ),
+            (
+                "allowed_request_content_type_charset",
+                "|utf-8| |iso-8859-1| |iso-8859-15| |windows-1252|",
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        if ml {
+            waf.ml = Some(sentinel_core::config::MlConfig {
+                enable: true,
+                models: vec![],
+                sensitivity: 0.9,
+            });
+        }
+        let (shutdown_tx, jh) = start_proxy(cfg).await;
+
+        let refused = [
+            (
+                "restricted extension",
+                Method::GET,
+                "/backup.bak",
+                vec![],
+                "",
+            ),
+            (
+                "forbidden content type",
+                Method::POST,
+                "/submit",
+                vec![("content-type", "application/x-evil")],
+                "a=1",
+            ),
+            (
+                "restricted header",
+                Method::GET,
+                "/probe",
+                vec![("proxy", "http://proxy.example")],
+                "",
+            ),
+        ];
+        for (what, method, uri, headers, body) in refused {
+            let status = send_with_headers(listen_port, method, uri, &headers, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what} passed (ml: {ml})");
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused request reached the origin (ml: {ml})"
+        );
+
+        let status = send_with_headers(listen_port, Method::GET, "/index.html", &[], "").await;
+        assert_eq!(status, StatusCode::OK, "control request (ml: {ml})");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        shutdown_proxy(shutdown_tx, jh).await;
+    }
+}

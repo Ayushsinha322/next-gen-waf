@@ -5706,8 +5706,9 @@ fn fused_score(ctx: &RequestContext, f: &FusionConfig) -> u32 {
 /// The three conditions:
 ///
 /// 1. No rule fired that the classifier cannot judge (`classifier_cannot_judge`):
-///    our in-house coverage signatures (99002xx), and OWASP CRS's Java attack
-///    rules (944xxx), Log4Shell among them.
+///    our in-house coverage signatures (99002xx), OWASP CRS's Java attack
+///    rules (944xxx), Log4Shell among them, and the rules that enforce the
+///    site's own policy lists (`POLICY_LIST_RULES`).
 /// 2. The rule evidence is thin — under 20, i.e. two or three CRS matches.
 ///    This deliberately reads `anomaly_score`, the RAW rule score, in both
 ///    paths: "how much did the rules actually see" is the same question
@@ -5740,9 +5741,41 @@ fn ml_vetoes_weak_block(ctx: &RequestContext) -> bool {
 ///   open-appsec's dataset Log4Shell detection fell from 82.7% at level 2 to
 ///   25.5% at level 1, plain `${jndi:ldap://…}` included. At level 2 a third
 ///   rule usually lifted the evidence past the veto's cap, which hid this.
+/// - `POLICY_LIST_RULES`: a match there is not a guess about the payload but
+///   the operator's own rule — this extension, header, content type, method,
+///   version or size is not allowed on this site. "The text looks benign" is
+///   no answer to that; `/backup.bak` IS benign text. With the lists set and
+///   the CRS threshold of 5, the veto passed `/backup.bak`, a `Proxy:` header
+///   and `Content-Type: application/x-evil` to the origin (payload 0.11–0.13),
+///   all three a 403 with the classifier off (external review, 2026-10-27).
 fn classifier_cannot_judge(rule_id: &str) -> bool {
-    rule_id.starts_with("99002") || rule_id.starts_with("944")
+    rule_id.starts_with("99002")
+        || rule_id.starts_with("944")
+        || POLICY_LIST_RULES.contains(&rule_id)
 }
+
+/// The CRS rules that test a request against a `tx.` list the site defines
+/// (`seed_crs_policy`): allowed methods, content types, charsets and HTTP
+/// versions, restricted extensions and headers, argument and file size caps.
+/// With its list unset such a rule cannot fire at all, so a match means the
+/// operator chose that policy. Pinned to the shipped rule files by
+/// `policy_list_rules_are_exactly_the_rules_reading_a_policy_list`.
+const POLICY_LIST_RULES: [&str; 14] = [
+    "911100", // allowed_methods
+    "920360", // arg_name_length
+    "920370", // arg_length
+    "920380", // max_num_args
+    "920390", // total_arg_length
+    "920400", // max_file_size
+    "920410", // combined_file_sizes
+    "920420", // allowed_request_content_type
+    "920430", // allowed_http_versions
+    "920440", // restricted_extensions
+    "920450", // restricted_headers_basic
+    "920451", // restricted_headers_extended
+    "920480", // allowed_request_content_type_charset
+    "922100", // allowed_request_content_type_charset (multipart parts)
+];
 
 /// TX variable holding the classifier's payload score when its veto cleared a
 /// block the rules had reached. The event message reads it: without it the log
@@ -13167,6 +13200,101 @@ mod fusion_tests {
             assert_eq!(c.decision, WafDecision::Allow, "no Java rule: veto applies");
             assert_eq!(c.tx_vars.get(ML_VETO_TX).map(String::as_str), Some("0.49"));
         }
+    }
+
+    /// A policy-list rule enforces what the operator chose — `.bak` is not
+    /// served here — so the classifier's "benign text" cannot clear it. The
+    /// review's three reproductions, at the CRS threshold of 5, on both
+    /// verdict paths; the same score from an attack rule is still vetoed.
+    #[test]
+    fn the_classifier_cannot_clear_a_policy_list_rule_block() {
+        for w in [
+            waf(1, 5, None),
+            waf(1, 5, Some(fusion(true, &[], vec![5, 5, 5, 5], vec![]))),
+        ] {
+            for (id, matched) in [
+                ("920440", ".bak"),
+                ("920420", "|application/x-evil|"),
+                ("920450", "/proxy/"),
+            ] {
+                let mut c = ctx();
+                c.add_engine_score("rules", 5);
+                c.ml_scores.insert("payload_attack".to_string(), 0.11);
+                c.rule_matches.push(rule_match(id, matched));
+                apply_verdict(&mut c, &w);
+                assert_eq!(c.decision, WafDecision::Block, "{id} vetoed");
+                assert!(!c.tx_vars.contains_key(ML_VETO_TX), "{id}");
+            }
+
+            let mut c = ctx();
+            c.add_engine_score("rules", 5);
+            c.ml_scores.insert("payload_attack".to_string(), 0.11);
+            c.rule_matches.push(rule_match("942100", "select"));
+            apply_verdict(&mut c, &w);
+            assert_eq!(c.decision, WafDecision::Allow, "attack rule: veto applies");
+        }
+    }
+
+    /// `POLICY_LIST_RULES` is a hand-kept list, so it is checked against the
+    /// rule files it describes: every shipped rule that reads one of the
+    /// policy variables `seed_crs_policy` sets, and nothing else. A CRS
+    /// upgrade that adds or renumbers such a rule fails here instead of
+    /// quietly handing that rule back to the veto.
+    #[test]
+    fn policy_list_rules_are_exactly_the_rules_reading_a_policy_list() {
+        const POLICY_VARS: [&str; 13] = [
+            "allowed_methods",
+            "allowed_request_content_type_charset",
+            "allowed_request_content_type",
+            "allowed_http_versions",
+            "restricted_extensions",
+            "restricted_headers_basic",
+            "restricted_headers_extended",
+            "max_num_args",
+            "arg_name_length",
+            "arg_length",
+            "total_arg_length",
+            "max_file_size",
+            "combined_file_sizes",
+        ];
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules/owasp-crs/rules");
+        let id_re = regex::Regex::new(r"id:(\d+)").unwrap();
+        let var_re =
+            regex::Regex::new(&format!(r"(?i)tx\.(?:{})\b", POLICY_VARS.join("|"))).unwrap();
+        let mut found = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // 901 DEFINES the variables; only the rules that read them count.
+            if !name.starts_with("REQUEST-9") || !name.ends_with(".conf") || name.contains("901") {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path())
+                .unwrap()
+                .replace("\\\n", " ");
+            // A statement with an id opens a rule; one without continues the
+            // chain the last id opened.
+            let mut current: Option<String> = None;
+            for line in text.lines().map(str::trim) {
+                if !line.starts_with("SecRule") && !line.starts_with("SecAction") {
+                    continue;
+                }
+                if let Some(m) = id_re.captures(line) {
+                    current = Some(m[1].to_string());
+                }
+                if var_re.is_match(line) {
+                    found.insert(current.clone().expect("a policy variable outside any rule"));
+                }
+            }
+        }
+        let listed: std::collections::BTreeSet<String> =
+            POLICY_LIST_RULES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            found,
+            listed,
+            "POLICY_LIST_RULES is out of step with {}",
+            dir.display()
+        );
     }
 
     /// The live reproduction, as a test. A benign search term earning 15 from
