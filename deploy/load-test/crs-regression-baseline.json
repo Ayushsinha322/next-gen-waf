@@ -1,58 +1,26 @@
 {
  "cases": {
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#11#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#12#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#13#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#15#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#16#0": {
    "missing": [
     920100
    ],
    "result": "fail"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#2#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#4#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#5#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
+   "reason": "status 501, CRS expects 400",
+   "result": "fail"
   },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#6#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#1#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#2#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#3#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920160.yaml#5#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml#8#0": {
+   "reason": "status 200, CRS expects 400",
+   "result": "fail"
   },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920180.yaml#4#0": {
    "reason": "no access-log line: rejected before the WAF",
@@ -68,9 +36,17 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920280.yaml#3#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920270.yaml#4#0": {
+   "reason": "status 200, CRS expects 400",
+   "result": "fail"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920274.yaml#1#0": {
+   "reason": "status 200, CRS expects 400",
+   "result": "fail"
+  },
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920290.yaml#1#0": {
+   "reason": "status 200, CRS expects 400",
+   "result": "fail"
   },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920300.yaml#3#0": {
    "reason": "no access-log line: rejected before the WAF",
@@ -88,14 +64,6 @@
    ],
    "result": "fail"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#10#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#3#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#4#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
@@ -104,21 +72,13 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#6#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#7#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
-  },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#8#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
-  "REQUEST-920-PROTOCOL-ENFORCEMENT/920430.yaml#9#0": {
-   "reason": "no access-log line: rejected before the WAF",
-   "result": "unsupported"
+  "REQUEST-920-PROTOCOL-ENFORCEMENT/920610.yaml#2#0": {
+   "reason": "status 200, CRS expects 400",
+   "result": "fail"
   },
   "REQUEST-920-PROTOCOL-ENFORCEMENT/920620.yaml#1#0": {
    "result": "fail",
@@ -142,6 +102,34 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#1#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#2#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#3#0": {
+   "reason": "asserts nothing this runner evaluates: no_match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#4#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#5#0": {
+   "reason": "asserts nothing this runner evaluates: no_match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#6#0": {
+   "reason": "asserts nothing this runner evaluates: no_match_regex",
+   "result": "unsupported"
+  },
+  "REQUEST-922-MULTIPART-ATTACK/922130.yaml#7#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
+   "result": "unsupported"
+  },
   "REQUEST-930-APPLICATION-ATTACK-LFI/930110.yaml#7#0": {
    "result": "fail",
    "unwanted": [
@@ -156,12 +144,20 @@
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932200.yaml#13#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
+   "result": "unsupported"
+  },
   "REQUEST-932-APPLICATION-ATTACK-RCE/932230.yaml#1#0": {
    "reason": "no access-log line: rejected before the WAF",
    "result": "unsupported"
   },
   "REQUEST-932-APPLICATION-ATTACK-RCE/932236.yaml#21#0": {
    "reason": "no access-log line: rejected before the WAF",
+   "result": "unsupported"
+  },
+  "REQUEST-932-APPLICATION-ATTACK-RCE/932239.yaml#54#0": {
+   "reason": "asserts nothing this runner evaluates: no_log_contains",
    "result": "unsupported"
   },
   "REQUEST-932-APPLICATION-ATTACK-RCE/932240.yaml#14#0": {
@@ -210,6 +206,10 @@
   },
   "REQUEST-933-APPLICATION-ATTACK-PHP/933110.yaml#30#0": {
    "reason": "rule not loaded by the product",
+   "result": "unsupported"
+  },
+  "REQUEST-933-APPLICATION-ATTACK-PHP/933120.yaml#2#0": {
+   "reason": "asserts nothing this runner evaluates: match_regex",
    "result": "unsupported"
   },
   "REQUEST-933-APPLICATION-ATTACK-PHP/933200.yaml#5#0": {
@@ -686,12 +686,12 @@
   }
  },
  "meta": {
-  "binary_sha256": "98a168686bce9231bec5b44379bdd4f6f1e0686a9531915580329406df6d794c",
-  "commit": "30df6e824e752c0333b8f451c102ce28a6bab2c2",
+  "binary_sha256": "523b1296a6ef7d42b207640d656eed724c28db48f69891b7157bcc3996603705",
+  "commit": "9aaa60dcac14a97d9c3beef929a7780f454aa544",
   "config_sha256": "b452a2291b24ea33523828b54b2a79b0c9b0b9a3231967dd803a392c7a555839",
-  "engine": "sentinel-bin 30df6e8",
-  "runner_sha256": "f13d190ae0cd6336187e06b5b24d2af53122c4072cfcef6a49f35d20be324531",
-  "started_at": "2026-10-24T09:50:33+00:00",
+  "engine": "sentinel-bin 9aaa60d",
+  "runner_sha256": "381930ded6906fcb88db4601763b365d6fc7523b658831af746ddf33551a57d7",
+  "started_at": "2026-10-27T06:52:07+00:00",
   "suite": {
    "crs_version": "4.7.0",
    "suite_sha256": "832c62d0508d7bc6e17b1dc4846c74ccbfec86958d8db15c5deb5dce2e26d09b"

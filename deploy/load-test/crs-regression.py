@@ -43,20 +43,30 @@ unsupported ("correlation mismatch"), never silently used.
 
 WHAT EACH CASE IS
 
-  pass         every expected rule ID fired and no forbidden one did
-  fail         an expected ID did not fire, or a forbidden one did
+  pass         every expected rule ID fired and no forbidden one did; or, for a
+               case whose only assertion is a status code, that status came back
+  fail         an expected ID did not fire, or a forbidden one did; or the
+               status of a status-only case differs (`reason` names both)
   unsupported  the test cannot say anything about this engine; `reason` says why:
                  rule not loaded by the product
                  response rule: needs CRS's echo backend
+                 asserts nothing this runner evaluates: match_regex, ...
                  no access-log line: rejected before the WAF
                  answered before the rule engine (threat intel / IP reputation)
                  the logs list only part of the rules that matched
                  correlation mismatch
   skipped      not run (--only)
 
-A status-code expectation is reported separately: CRS writes those for
-Apache's behaviour, and a different HTTP stack answers differently without
-the rule being wrong.
+`assertion` records what a case was scored by: `rule ids` or `status`. A case
+is never a pass by default — one whose assertions are all of a kind this
+runner does not evaluate (match_regex, no_match_regex, log_contains,
+no_log_contains) is unsupported, and every case lists those in `unevaluated`.
+It used to count as a pass: 15 cases did (external review, 2026-10-27).
+
+The status code of a case that ALSO asserts rule IDs is reported separately,
+not scored: CRS writes those for Apache's behaviour in blocking mode, the
+gate runs in learning mode, and a different HTTP stack answers differently
+without the rule being wrong. The report keeps the two metrics apart.
 
 EXIT STATUS — the CI policy
 
@@ -443,12 +453,46 @@ def run(args):
                 if loaded is not None and (expect or {rule_id}) - loaded:
                     case.update(result="unsupported", reason="rule not loaded by the product")
                     continue
+                # What the case asserts besides rule IDs. A case is scored only
+                # by an assertion this runner evaluates: rule IDs, or — when
+                # that is all it has — the status code. Anything else
+                # (match_regex, no_match_regex, log_contains, no_log_contains)
+                # is listed, never taken as a pass.
+                want_status = out.get("status")
+                unevaluated = sorted({k for k in log if k not in ("expect_ids", "no_expect_ids")}
+                                     | {k for k in out if k not in ("log", "status")})
+                if unevaluated:
+                    case["unevaluated"] = unevaluated
+                status_only = not (expect or forbid) and want_status is not None
+                if not (expect or forbid or status_only):
+                    case.update(result="unsupported",
+                                reason="asserts nothing this runner evaluates: "
+                                       + (", ".join(unevaluated) or "no assertion"))
+                    continue
                 marker = None
                 if not inp.get("encoded_request") and inp.get("autocomplete_headers", True):
                     marker = str(uuid.uuid4())
                 while not lines.empty():
                     lines.get_nowait()
                 case["status"] = send((args.host, args.port), build_request(inp, marker))
+                if want_status is not None:
+                    allowed = set(want_status) if isinstance(want_status, list) else {want_status}
+                    case["status_ok"] = case["status"] in allowed
+                if status_only:
+                    # The status IS the test, so it is judged whether or not
+                    # the request got as far as the WAF: CRS's malformed-request
+                    # tests expect the HTTP layer to refuse them with a 400.
+                    # The log line is still read, so it cannot be taken for the
+                    # next case's.
+                    case["assertion"] = "status"
+                    case["reached_waf"] = next_line_for(lines, inp) is not None
+                    if case["status_ok"]:
+                        case["result"] = "pass"
+                    else:
+                        case.update(result="fail", reason=f"status {case['status']}, "
+                                    f"CRS expects {' or '.join(map(str, sorted(allowed)))}")
+                    continue
+                case["assertion"] = "rule ids"
                 rec = next_line_for(lines, inp)
                 if rec is None:
                     case.update(result="unsupported",
@@ -494,10 +538,6 @@ def run(args):
                     case["missing"] = sorted(missing)
                 if unwanted:
                     case["unwanted"] = sorted(unwanted)
-                want_status = out.get("status")
-                if want_status is not None:
-                    allowed = set(want_status) if isinstance(want_status, list) else {want_status}
-                    case["status_ok"] = case["status"] in allowed
     for p in procs:
         if p is not None:
             p.terminate()
@@ -513,10 +553,19 @@ def report(cases):
     corr = Counter(c.get("correlation") for c in cases if c.get("correlation"))
     if corr:
         print("  correlation: " + ", ".join(f"{k} {v}" for k, v in sorted(corr.items())))
-    status_checked = [c for c in cases if "status_ok" in c]
+    for kind in ("rule ids", "status"):
+        t = Counter(c["result"] for c in cases if c.get("assertion") == kind)
+        if t:
+            print(f"  scored by {kind}: pass {t['pass']}, fail {t['fail']}, "
+                  f"unsupported {t['unsupported']}")
+    status_checked = [c for c in cases if "status_ok" in c and c.get("assertion") == "rule ids"]
     if status_checked:
-        print(f"  status expectations: {sum(c['status_ok'] for c in status_checked)}"
+        print(f"  status expectations beside rule IDs: {sum(c['status_ok'] for c in status_checked)}"
               f" of {len(status_checked)} as CRS expects (reported, not scored)")
+    unevaluated = Counter(a for c in cases for a in c.get("unevaluated", ()))
+    if unevaluated:
+        print("  assertions not evaluated: "
+              + ", ".join(f"{k} x{n}" for k, n in sorted(unevaluated.items())))
     by_family = defaultdict(Counter)
     for c in cases:
         by_family[c["file"].split("/")[0]][c["result"]] += 1
