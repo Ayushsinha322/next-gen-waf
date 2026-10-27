@@ -256,6 +256,43 @@ fn rule_920450_flags_a_restricted_header_wherever_it_appears() {
     );
 }
 
+/// The event names what violated the policy. The policy rules end their chain
+/// with a `@within` list check, which recorded no value, so the record kept
+/// the parent's last header name: a request refused for `Proxy:` was logged
+/// as `matched=accept-encoding`, under the literal message "HTTP header is
+/// restricted by policy (%{MATCHED_VAR})" — and an operator excluding what
+/// the log named would have excluded the wrong header (external review,
+/// 2026-10-27).
+#[test]
+fn a_policy_rule_event_names_the_value_that_broke_the_policy() {
+    let eng = protocol_engine();
+    let mut ctx = policy_get("/");
+    header(&mut ctx, "Proxy", "http://proxy.example");
+    header(&mut ctx, "Accept", "text/html");
+    header(&mut ctx, "Accept-Encoding", "gzip");
+    eval(&eng, &mut ctx, Phase::RequestHeaders);
+    let m = ctx
+        .rule_matches
+        .iter()
+        .find(|m| m.rule_id == "920450")
+        .unwrap_or_else(|| panic!("920450 must fire; fired: {:?}", ids(&ctx)));
+    assert_eq!(m.matched_value, "/proxy/");
+    assert_eq!(m.message, "HTTP header is restricted by policy (/proxy/)");
+
+    let mut ctx = policy_post("application/x-evil");
+    eval(&eng, &mut ctx, Phase::RequestHeaders);
+    let m = ctx
+        .rule_matches
+        .iter()
+        .find(|m| m.rule_id == "920420")
+        .unwrap_or_else(|| panic!("920420 must fire; fired: {:?}", ids(&ctx)));
+    assert!(
+        m.matched_value.contains("application/x-evil"),
+        "920420 matched {:?}",
+        m.matched_value
+    );
+}
+
 #[test]
 fn rule_920451_is_paranoia_level_two() {
     let eng = protocol_engine();

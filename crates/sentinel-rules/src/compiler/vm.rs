@@ -3045,9 +3045,16 @@ pub fn evaluate(
                             }
                         };
                         // Negated per value, as `!@rx` is: any value for which
-                        // the comparison does not hold.
-                        let verdict: Option<bool> =
-                            bound.map(|b| values.iter().any(|v| holds(v, b) != *negate));
+                        // the comparison does not hold. The value that decided
+                        // it is recorded like every other operator's hit: CRS's
+                        // policy rules end their chain here, so without it a
+                        // 920450 event named the parent's last header name
+                        // (`accept-encoding`) instead of the restricted one.
+                        let verdict: Option<bool> = bound.map(|b| {
+                            let hit = values.iter().find(|v| holds(v, b) != *negate);
+                            record_match(&mut last_matched, hit);
+                            hit.is_some()
+                        });
                         match verdict {
                             Some(matched) => {
                                 debug!(pat = %pat, matched, "MatchInterpolated");
@@ -3475,7 +3482,7 @@ fn fire_rule(
     if !is_silent {
         ctx.rule_matches.push(RuleMatch {
             rule_id: meta.id.to_string(),
-            message: meta.message.clone(),
+            message: expand_matched_var(&meta.message, matched_value.as_deref()),
             severity: map_severity(meta.severity),
             score: meta.score_delta.max(0) as u32,
             target: matched_target.unwrap_or_default(),
@@ -3490,6 +3497,28 @@ fn fire_rule(
         score_delta = meta.score_delta,
         "rule fired"
     );
+}
+
+/// A rule message with `%{MATCHED_VAR}` replaced by the value the rule
+/// matched — the last link's, already capped and redacted — as ModSecurity
+/// expands it when it logs. CRS 920450 and 920451 put the restricted header
+/// in their message that way, and the event read "HTTP header is restricted
+/// by policy (%{MATCHED_VAR})". Other macros are left as written: this is the
+/// only one a match record can answer truthfully.
+fn expand_matched_var(message: &str, matched_value: Option<&str>) -> String {
+    const MACRO: &str = "%{matched_var}";
+    let Some(at) = message.to_ascii_lowercase().find(MACRO) else {
+        return message.to_owned();
+    };
+    let value = matched_value.unwrap_or_default();
+    let mut out = String::with_capacity(message.len() + value.len());
+    out.push_str(&message[..at]);
+    out.push_str(value);
+    out.push_str(&expand_matched_var(
+        &message[at + MACRO.len()..],
+        matched_value,
+    ));
+    out
 }
 
 // ---------------------------------------------------------------------------
