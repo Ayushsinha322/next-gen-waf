@@ -101,7 +101,15 @@ hyperscan = "0.3"           # high-perf DPI (optional)
 # only 36.0.19 fixes, RUSTSEC-2026-0380 among them — a Cranelift overflow that a
 # crafted plugin could take to a sandbox escape. wasmtime-wasi was declared here
 # and used by nothing; plugins get no WASI.
-wasmtime = "36.0.19"
+# Every default feature but `cache`: nothing here configures wasmtime's on-disk
+# compilation cache, and it was the last user of zstd 0.13, whose zstd-safe 7 /
+# zstd-sys 2.0 carry RUSTSEC-2026-0391/-0398/-0403/-0410.
+wasmtime = { version = "36.0.19", default-features = false, features = [
+  "async", "gc", "gc-drc", "gc-null", "wat", "profiling", "parallel-compilation",
+  "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
+  "debug-builtins", "runtime", "component-model", "threads", "stack-switching",
+  "std",
+] }
 
 # ML inference
 ort = "2.0.0-rc.4"          # ONNX runtime

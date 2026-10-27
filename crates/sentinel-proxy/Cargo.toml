@@ -40,10 +40,13 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 # Public trust anchors for the SIEM feed when no private CA is configured.
 webpki-roots = "1"
 # Request bodies sent with a Content-Encoding are decoded for inspection
-# (src/content_coding.rs). flate2 and zstd are already in the build (sentinel-cli,
-# wasmtime's cache); brotli-decompressor is pure Rust and decodes only.
+# (src/content_coding.rs). brotli-decompressor is pure Rust and decodes only.
+# zstd 0.14.3 or later: 0.13.3 and its zstd-safe 7 / zstd-sys 2.0 carry
+# RUSTSEC-2026-0391/-0398/-0403/-0410. None is reachable here (one fresh
+# `read::Decoder` per body, no legacy or seekable feature, not wasm32), but
+# they are fixed rather than ignored.
 flate2 = "1"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 brotli-decompressor = "6"
 # HTTP/3 (QUIC transport + h3 protocol layer)
 quinn = { workspace = true }
