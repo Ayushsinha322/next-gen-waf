@@ -9,8 +9,8 @@ re-runs during packaging. Run it after changing a dependency. Do not edit by han
 It records what each component **declares** in its own manifest. It is an
 attribution inventory, not a legal review.
 
-**434 redistributed components** across Rust, Go, npm and container images.
-A further 114 Rust crates and 399 npm packages are
+**431 redistributed components** across Rust, Go, npm and container images.
+A further 109 Rust crates and 399 npm packages are
 build- or development-only: they are compiled or installed here but never
 shipped, and are listed separately at the end so the two are never confused.
 
@@ -28,9 +28,9 @@ the OWASP Core Rule Set keeps its own copy at `rules/owasp-crs/LICENSE`.
 
 ## Rust crates (data plane)
 Reachable through normal (non-dev, non-build) edges from a shipped binary, so these are compiled into what customers run. Workspace members excluded.
-**297 components.**
+**294 components.**
 
-### MIT OR Apache-2.0 — 138 component(s)
+### MIT OR Apache-2.0 — 135 component(s)
 - allocator-api2 0.2.21
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -64,8 +64,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - crypto-common 0.1.7
 - deranged 0.5.9
 - digest 0.10.7
-- directories-next 2.0.0
-- dirs-sys-next 0.1.2
 - displaydoc 0.2.7
 - either 1.15.0
 - errno 0.3.14
@@ -168,9 +166,8 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - url 2.5.8
 - xattr 1.6.1
 - yasna 0.5.2
-- zstd-safe 7.2.4
 
-### MIT — 41 component(s)
+### MIT — 40 component(s)
 - bytes 1.11.1
 - combine 4.6.7
 - dashmap 6.1.0
@@ -211,9 +208,8 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - want 0.3.1
 - winnow 0.7.15
 - zmij 1.0.21
-- zstd 0.13.3
 
-### Apache-2.0 WITH LLVM-exception — 28 component(s)
+### Apache-2.0 WITH LLVM-exception — 27 component(s)
 - cranelift-assembler-x64 0.123.19
 - cranelift-bforest 0.123.19
 - cranelift-bitset 0.123.19
@@ -230,7 +226,6 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - wasmtime 36.0.19
 - wasmtime-environ 36.0.19
 - wasmtime-internal-asm-macros 36.0.19
-- wasmtime-internal-cache 36.0.19
 - wasmtime-internal-component-macro 36.0.19
 - wasmtime-internal-component-util 36.0.19
 - wasmtime-internal-cranelift 36.0.19
@@ -293,21 +288,23 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - wat 1.248.0
 - wit-parser 0.236.1
 
-### BSD-3-Clause — 6 component(s)
+### BSD-3-Clause — 9 component(s)
 - alloc-no-stdlib 3.0.0
 - alloc-stdlib 0.3.0
 - libinjectionrs 0.1.1
 - redis 1.2.2
 - sha1_smol 1.0.1
 - subtle 2.6.1
+- zstd 0.14.3
+- zstd-safe 8.2.0
+- zstd-sys 2.1.2+zstd.1.5.7
 
-### MIT/Apache-2.0 — 6 component(s)
+### MIT/Apache-2.0 — 5 component(s)
 - filetime 0.2.28
 - id-arena 2.3.0
 - minimal-lexical 0.2.1
 - rustc-demangle 0.1.27
 - symlink 0.1.0
-- zstd-sys 2.0.16+zstd.1.5.7
 
 ### ISC — 4 component(s)
 - maxminddb 0.24.0
@@ -590,7 +587,7 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 
 ## Rust (dev- and build-dependencies)
 
-**114 components.**
+**109 components.**
 
 ### MIT OR Apache-2.0 — 57 component(s)
 - anes 0.1.6
@@ -667,31 +664,19 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - wit-component 0.244.0
 - wit-parser 0.244.0
 
-### MIT — 14 component(s)
+### MIT — 12 component(s)
 - cfg_aliases 0.2.1
 - crunchy 0.2.4
 - fs_extra 1.3.0
 - is-terminal 0.4.17
-- libredox 0.1.16
 - oorandom 11.1.5
 - plotters 0.3.7
 - plotters-backend 0.3.7
 - plotters-svg 0.3.7
 - redox_syscall 0.5.18
-- redox_users 0.4.6
 - tokio-stream 0.1.18
 - tokio-test 0.4.5
 - valuable 0.1.1
-
-### MIT/Apache-2.0 — 8 component(s)
-- android_system_properties 0.1.5
-- criterion-plot 0.5.0
-- fallible-iterator 0.3.0
-- itertools 0.10.5
-- version_check 0.9.5
-- winapi 0.3.9
-- winapi-i686-pc-windows-gnu 0.4.0
-- winapi-x86_64-pc-windows-gnu 0.4.0
 
 ### Apache-2.0 WITH LLVM-exception — 6 component(s)
 - cranelift-assembler-x64-meta 0.123.19
@@ -700,6 +685,13 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - cranelift-srcgen 0.123.19
 - wasmtime-internal-winch 36.0.19
 - winch-codegen 36.0.19
+
+### MIT/Apache-2.0 — 5 component(s)
+- android_system_properties 0.1.5
+- criterion-plot 0.5.0
+- fallible-iterator 0.3.0
+- itertools 0.10.5
+- version_check 0.9.5
 
 ### Apache-2.0 — 3 component(s)
 - ciborium 0.2.2
