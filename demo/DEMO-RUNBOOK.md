@@ -85,7 +85,7 @@ The WAF has a **behavioral correlation engine**: after a burst of blocks from on
 
 ## 5 · Trust talking points (why it's real, not a toy)
 - **Full OWASP Top 10 coverage** — 2,541 OWASP Core Rule Set rules, verified blocking SQLi, XSS, traversal, injection, SSRF, XXE, Log4Shell.
-- **Live threat intelligence** — 29,674 IOCs auto-synced hourly from Tor / abuse.ch Feodo / URLhaus; known-bad sources blocked *before* rules even run.
+- **Live threat intelligence** — about 1,300 IOCs auto-synced hourly from Tor / abuse.ch Feodo plus a built-in scanner list; known-bad sources blocked *before* rules even run.
 - **ML anomaly engine** — behavioral scoring + repeat-attacker correlation, not just static signatures.
 - **Sub-millisecond latency** — p99 < 1ms; the Rust data plane adds effectively zero user-facing delay.
 - **Modern stack** — HTTP/3 (QUIC), per-site TLS, private-CA management console.

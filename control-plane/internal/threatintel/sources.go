@@ -12,10 +12,17 @@ import (
 // Default upstream feeds. All are open, no-API-key sources. Any can be
 // overridden or disabled via env (see ConfigFromEnv); set a URL to "off" or "-"
 // to disable that feed while keeping the others.
+//
+// URLhaus is off by default: abuse.ch retired its unauthenticated bulk
+// downloads — https://urlhaus.abuse.ch/downloads/text/ and every sibling
+// answer 410 Gone, and the API wants an Auth-Key — so the default fetch failed
+// every cycle and contributed nothing. Point SENTINEL_TI_URLHAUS_URL (or the
+// threat_intel.feed.urlhaus setting) at a source that serves the same plaintext
+// format to turn it back on.
 const (
 	defaultTorURL     = "https://check.torproject.org/torbulkexitlist"
 	defaultFeodoURL   = "https://feodotracker.abuse.ch/downloads/ipblocklist.json"
-	defaultURLhausURL = "https://urlhaus.abuse.ch/downloads/text/"
+	defaultURLhausURL = "off"
 	// STIX/TAXII is opt-in (no universal free endpoint) — set SENTINEL_TI_STIX_URL
 	// to a collection that serves a STIX 2.x bundle to enable it.
 	defaultSTIXURL = ""

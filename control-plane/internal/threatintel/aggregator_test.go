@@ -180,6 +180,26 @@ func TestConfigSourcesDisable(t *testing.T) {
 	}
 }
 
+// abuse.ch retired the URLhaus bulk download (410 Gone), so a default install
+// must not fetch it: it failed every cycle and added nothing.
+func TestURLhausIsOffByDefault(t *testing.T) {
+	t.Setenv("SENTINEL_TI_URLHAUS_URL", "")
+	for _, s := range ConfigFromEnv().Sources() {
+		if s.Name == "urlhaus" {
+			t.Fatalf("urlhaus enabled by default with URL %q", s.URL)
+		}
+	}
+	cfg := ConfigFromEnv()
+	cfg.URLhausURL = "https://mirror.example/urlhaus.txt"
+	found := false
+	for _, s := range cfg.Sources() {
+		found = found || s.Name == "urlhaus"
+	}
+	if !found {
+		t.Error("an operator-supplied URLhaus URL must still enable the feed")
+	}
+}
+
 // A locally generated source must be reconciled so an entry withdrawn from the
 // seed stops enforcing; a URL feed must NOT be, because a feed that returns
 // nothing because it was unreachable would otherwise delete its own corpus.

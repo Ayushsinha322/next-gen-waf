@@ -30,6 +30,18 @@ func TestResolutionOrderDBOverEnvOverDefault(t *testing.T) {
 	}
 }
 
+// The console's settings are what controllerd hands the aggregator, so the
+// URLhaus default must be off here too, not only in threatintel's env defaults.
+func TestURLhausFeedDefaultsOff(t *testing.T) {
+	k, ok := Lookup("threat_intel.feed.urlhaus")
+	if !ok || k.Default != "off" {
+		t.Fatalf("threat_intel.feed.urlhaus default = %v, want off", k.Default)
+	}
+	if err := k.Validate(k.Default); err != nil {
+		t.Fatalf("default must pass its own validator: %v", err)
+	}
+}
+
 func TestCoerceRejectsBadValues(t *testing.T) {
 	k, _ := Lookup("alerting.auto_resolve_secs")
 	if _, err := Coerce(k, json.RawMessage(`30`)); err == nil {

@@ -78,8 +78,8 @@ var Registry = []Key{
 		Env: "SENTINEL_TI_TOR_URL", Description: "Tor exit-node list (watch tier). Set to 'off' to disable this feed.", Validate: urlOrOff},
 	{Name: "threat_intel.feed.feodo", Group: "threat_intel", Type: String, Unit: "url", Default: "https://feodotracker.abuse.ch/downloads/ipblocklist.json", Applies: "live",
 		Env: "SENTINEL_TI_FEODO_URL", Description: "abuse.ch Feodo Tracker botnet C2 IPs (block tier). 'off' disables.", Validate: urlOrOff},
-	{Name: "threat_intel.feed.urlhaus", Group: "threat_intel", Type: String, Unit: "url", Default: "https://urlhaus.abuse.ch/downloads/text/", Applies: "live",
-		Env: "SENTINEL_TI_URLHAUS_URL", Description: "abuse.ch URLhaus malware-distribution domains (block tier). 'off' disables.", Validate: urlOrOff},
+	{Name: "threat_intel.feed.urlhaus", Group: "threat_intel", Type: String, Unit: "url", Default: "off", Applies: "live",
+		Env: "SENTINEL_TI_URLHAUS_URL", Description: "URLhaus-format malware-distribution URL list, one per line (block tier). Off by default: abuse.ch retired the free download. 'off' disables.", Validate: urlOrOff},
 	{Name: "threat_intel.feed.stix", Group: "threat_intel", Type: String, Unit: "url", Default: "", Applies: "live",
 		Env: "SENTINEL_TI_STIX_URL", Description: "A STIX 2.1 bundle URL from your own CTI platform. Empty or 'off' disables.", Validate: urlOrOff},
 	// ---- GeoIP ------------------------------------------------------------
