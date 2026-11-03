@@ -26,16 +26,15 @@ stages:
 # Which runner the test and build jobs run on (`tags: [$RUNNER_TAG]`).
 #
 # k8s-docker is runner #45, the Kubernetes executor on 172.16.23.48 these jobs
-# were written for (the disk notes below are about its node). It has been
-# offline since 2026-10-24 18:09 UTC and did not reconnect when GitLab came
-# back, so every pipeline sat pending until GitLab failed its jobs as
-# stuck_or_timeout_failure without running them. Until it returns they run on
-# ai-docs — runner #51, the Docker executor on a shared host (475 GB free) that
-# publish-images and release already use. Set this back to k8s-docker once #45
-# is online again; a single pipeline can also be pointed at either runner by
-# setting RUNNER_TAG when it is started.
+# were written for (the disk notes below are about its node). While it was
+# offline (2026-10-24 to at least 2026-10-27) every pipeline sat pending until
+# GitLab failed its jobs as stuck_or_timeout_failure, and the jobs ran on
+# ai-docs — runner #51, the Docker executor on a shared host that publish-images
+# and release already use. If #45 drops out again, set this to "ai-docs"; a
+# single pipeline can also be pointed at either runner by setting RUNNER_TAG
+# when it is started.
 variables:
-  RUNNER_TAG: "ai-docs"
+  RUNNER_TAG: "k8s-docker"
 
 # ── Rust data plane ──────────────────────────────────────────────────────────
 # Shared Rust CI settings.
