@@ -290,7 +290,7 @@ hdr "rolling ${#TARGETS[@]} service(s), one at a time"
 failed=0
 for svc in "${TARGETS[@]}"; do
   kind="other"
-  printf '%s\n' "${DP[@]}" | grep -qx "$svc" && kind="dataplane"
+  grep -qx "$svc" <<<"$(printf '%s\n' "${DP[@]}")" && kind="dataplane"
   roll_one "$svc" "$kind" || { failed=1; break; }
 done
 

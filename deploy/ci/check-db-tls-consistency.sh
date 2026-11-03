@@ -77,9 +77,9 @@ for f in "${FILES[@]}"; do
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     if (( TLS_REQUIRED == 1 )); then
-      if printf '%s' "$line" | grep -qE "$INSECURE_RE"; then
+      if grep -qE "$INSECURE_RE" <<<"$line"; then
         bad_lines+="      $line"$'\n'
-      elif ! printf '%s' "$line" | grep -q 'sslmode='; then
+      elif ! grep -q 'sslmode=' <<<"$line"; then
         missing_mode+="      $line"$'\n'
       fi
     fi
@@ -110,8 +110,8 @@ for f in "${FILES[@]}"; do
   [[ -f "$f" ]] || continue
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    if printf '%s' "$line" | grep -qE 'sslmode=verify-(full|ca)' \
-       && ! printf '%s' "$line" | grep -q 'sslrootcert='; then
+    if grep -qE 'sslmode=verify-(full|ca)' <<<"$line" \
+       && ! grep -q 'sslrootcert=' <<<"$line"; then
       printf '  %s✗%s %s: verify-* without sslrootcert\n' "$RED" "$R" "$(basename "$f")"
       printf '      %s%s%s\n' "$DIM" "$line" "$R"
       fail=$((fail + 1))

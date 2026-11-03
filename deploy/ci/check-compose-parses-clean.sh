@@ -305,7 +305,7 @@ check_passive_sink() {
 
   if [[ -z "$url" ]]; then
     problems+=("SENTINEL_CLICKHOUSE_URL is unset — events go nowhere")
-  elif printf '%s' "$url" | grep -qE 'localhost|127\.0\.0\.1|//clickhouse:|@clickhouse:'; then
+  elif grep -qE 'localhost|127\.0\.0\.1|//clickhouse:|@clickhouse:' <<<"$url"; then
     problems+=("sink points at a LOCAL ClickHouse this VM does not run: $url")
   fi
   [[ -n "$ca" ]] || problems+=("no SENTINEL_CLICKHOUSE_CA_FILE — an internal cert cannot verify")
@@ -418,9 +418,9 @@ check_https_is_ha() {
       inblk && /^  [^ ]/ { inblk = 0 }
       inblk          { print }
     ')
-    printf '%s\n' "$blk" | grep -qE '^        target: /var/lib/sentinel/certs[[:space:]]*$' \
+    grep -qE '^        target: /var/lib/sentinel/certs[[:space:]]*$' <<<"$blk" \
       || missing_certs="$missing_certs $svc"
-    printf '%s\n' "$blk" | grep -qE '^      SENTINEL_PROXY_PROTOCOL_LISTENERS:.*https' \
+    grep -qE '^      SENTINEL_PROXY_PROTOCOL_LISTENERS:.*https' <<<"$blk" \
       || missing_pp="$missing_pp $svc"
   done
   missing_certs="${missing_certs# }"; missing_pp="${missing_pp# }"

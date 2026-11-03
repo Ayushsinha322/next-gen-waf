@@ -101,7 +101,7 @@ step "Control plane → database"
 RDY=$(docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 http://controlplane:9501/readyz 2>/dev/null)
 if [[ -z "$RDY" ]]; then
   bad "control plane /readyz did not answer — it is not serving, or not on the sentinel network"
-elif printf '%s' "$RDY" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"'; then
+elif grep -q '"db"[[:space:]]*:[[:space:]]*"ok"' <<<"$RDY"; then
   pass "control plane is connected to its database"
 else
   bad "control plane is running WITHOUT a database — every login will return 503

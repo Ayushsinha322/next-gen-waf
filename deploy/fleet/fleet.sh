@@ -434,7 +434,7 @@ REMOTE
     if [[ "$code" == "200" ]]; then PASS "benign request served 200"
     else FAIL "benign request returned '${code:-no response}'"; fi
 
-    if echo "$out" | grep -q '"status":"ok"'; then PASS "data plane /healthz status ok"
+    if grep -q '"status":"ok"' <<<"$out"; then PASS "data plane /healthz status ok"
     else FAIL "data plane /healthz did not report ok"; fi
 
     # Pair-specific: replication is the thing a bad roll silently kills.

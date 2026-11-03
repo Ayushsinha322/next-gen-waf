@@ -263,7 +263,7 @@ if [[ "$MODE" == "check" ]]; then
   if [[ -z "$_rdy" ]]; then
     warn "control plane /readyz did not answer — not serving, or not on the network"
     CHECK_FAIL=1
-  elif printf '%s' "$_rdy" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"'; then
+  elif grep -q '"db"[[:space:]]*:[[:space:]]*"ok"' <<<"$_rdy"; then
     ok "control plane is connected to its database"
   else
     warn "control plane is running WITHOUT a database — every login returns 503"

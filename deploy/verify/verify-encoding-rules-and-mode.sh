@@ -70,7 +70,7 @@ SAMPLE=$(docker logs sentinel-waf1-1 2>&1 | grep -m1 "rule disabled")
 if [ -z "$SAMPLE" ]; then
   ok "nothing disabled, so nothing to name"
 else
-  echo "$SAMPLE" | grep -q "rule_id" \
+  grep -q "rule_id" <<<"$SAMPLE" \
     && ok "the warning names rule_id" \
     || bad "a rule was disabled and the warning does NOT name it: $SAMPLE"
 fi

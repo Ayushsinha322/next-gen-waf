@@ -98,9 +98,9 @@ hdr "5. Cleartext Postgres is refused (hostssl enforcement)"
 # Only meaningful once pg_hba is switched to hostssl; reported as WARN otherwise.
 out=$(docker run --rm --network sentinel_sentinel -e PGPASSWORD=x postgres:16-alpine \
       psql "postgres://sentinel:x@postgres:5432/sentinel?sslmode=disable" -c 'select 1' 2>&1 | head -3)
-if echo "$out" | grep -qiE "no encryption|no pg_hba|SSL.*required|connection.*rejected"; then
+if grep -qiE "no encryption|no pg_hba|SSL.*required|connection.*rejected" <<<"$out"; then
   PASS "cleartext connection refused by server policy"
-elif echo "$out" | grep -qiE "password authentication failed"; then
+elif grep -qiE "password authentication failed" <<<"$out"; then
   WARN "cleartext reached AUTH (server still permits non-TLS; pg_hba not yet hostssl-only)"
 else WARN "inconclusive: $(echo "$out" | tr '\n' ' ' | cut -c1-120)"; fi
 
@@ -216,7 +216,7 @@ case "$c" in 200|301|302|307|308) PASS "https :9443/login -> $c";; *) WARN "http
 for c in controlplane cp2 cp3; do
   h=$(docker run --rm --network sentinel_sentinel curlimages/curl:latest \
         -s --max-time 10 "http://${c}:9501/health" 2>/dev/null | head -c 120)
-  if echo "$h" | grep -q '"status"'; then PASS "$c /health -> $h"
+  if grep -q '"status"' <<<"$h"; then PASS "$c /health -> $h"
   else FAIL "$c /health unreadable (got: ${h:-<empty>})"; fi
 done
 

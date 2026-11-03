@@ -30,15 +30,23 @@
 #
 #  Capture first, match the variable, no pipeline, no exit-status puzzle.
 #
-#  SCOPE: unbounded producers, AND the Docker CLI's list commands. `echo`,
-#  `printf`, `ss`, `ip` and a `psql -tAc` are buffered: they hand grep their
-#  whole output in one write and are done before it can exit, so they are left
-#  alone. Size is not the whole story, though. Docker and Compose are Go
-#  programs whose stdout is unbuffered — one write per LINE — so a short list is
-#  enough when the match is not its last line. `dc config --services` (13
-#  lines, in a different order every run) dropped the dashboard from
-#  rolling-update.sh in 2 runs of 15 on .71, and the 1.1.20 roll reported
-#  success with the console still on the old image.
+#  SCOPE: unbounded producers, the Docker CLI's list commands, and `echo` /
+#  `printf`. Size is not the whole story. Docker and Compose are Go programs
+#  whose stdout is unbuffered — one write per LINE — so a short list is enough
+#  when the match is not its last line. `dc config --services` (13 lines, in a
+#  different order every run) dropped the dashboard from rolling-update.sh in 2
+#  runs of 15 on .71, and the 1.1.20 roll reported success with the console
+#  still on the old image.
+#
+#  `echo` and `printf` were exempt here on the theory that a builtin hands grep
+#  its whole output in one write. That holds only below the libc's stdio buffer:
+#  4 KiB on glibc, 1 KiB on musl — and CI runs on Alpine. Pipeline 34039 (main,
+#  1.1.25) failed check-compose-parses-clean.sh with "[waf2] do not mount the
+#  shared cert volume" on a commit that passed on two other pipelines:
+#  `printf '%s\n' "$blk" | grep -q` on a 3.2 KiB block goes out in four writes,
+#  and grep can match and exit between them. Measured in alpine:3.20 with eight
+#  loops on one CPU: 1 false "absent" in 12,000; the here-string form, 0.
+#  ss, ip and `psql -tAc` stay exempt — their output here is short.
 # =============================================================================
 set -uo pipefail
 
@@ -54,6 +62,7 @@ UNBOUNDED='docker logs|docker compose logs|docker-compose logs|journalctl'
 UNBOUNDED+='|docker[[:space:]]+(ps|port|images|inspect)([[:space:]]|$)'
 UNBOUNDED+='|docker[ -]compose[^|]*[[:space:]](config|ps)([[:space:]]|$)'
 UNBOUNDED+='|(^|[^[:alnum:]_])dc[[:space:]]+(config|ps)([[:space:]]|$)'
+UNBOUNDED+='|(^|[^[:alnum:]_])(echo|printf)[[:space:]]'
 
 printf '\n%s%s==> no unbounded producer piped into grep -q%s\n\n' "$B" "$YEL" "$R"
 

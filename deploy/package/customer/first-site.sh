@@ -101,7 +101,7 @@ PW="${SENTINEL_ADMIN_PASSWORD:-$(sed -n 's/^SENTINEL_BOOTSTRAP_ADMIN_PASSWORD=//
 # up. Without one it serves forever in degraded mode and every login returns 503
 # — a state indistinguishable from healthy if you only look at `docker ps`.
 RDY=$(docker exec sentinel-clickhouse-1 wget -qO- --timeout=5 http://controlplane:9501/readyz 2>/dev/null)
-printf '%s' "$RDY" | grep -q '"db"[[:space:]]*:[[:space:]]*"ok"' \
+grep -q '"db"[[:space:]]*:[[:space:]]*"ok"' <<<"$RDY" \
   || die "the control plane is running WITHOUT a database — every login will fail.
     $RDY
     Restart it once Postgres is healthy:  docker restart sentinel-controlplane-1"
