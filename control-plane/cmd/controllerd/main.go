@@ -443,6 +443,9 @@ func run() error {
 			// container identities, not outages. See node_prune.go.
 			stops = append(stops, startNodePrune(store, cl, log))
 			cm := certmon.New(eng, dataPlaneBaseURL(), os.Getenv("SENTINEL_INTERNAL_SECRET"), log)
+			// Also the certificates the deployment itself runs on (internal CA,
+			// Postgres, ClickHouse): they expire on a known date, with no notice.
+			cm.SetInternalCerts(certmon.InternalSourceFromEnv().Certs)
 			cm.Start()
 			stops = append(stops, cm.Stop)
 			if chClient != nil && chClient.Enabled() {

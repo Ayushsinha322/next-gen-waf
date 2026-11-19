@@ -151,6 +151,14 @@ The internal certificate authority created at install lives in
 `/opt/sentinel-pki`. Download `root.crt` from this page and import it on trusted
 machines to remove browser warnings for internal names.
 
+The deployment's own certificates expire too: the internal CA, and the server
+certificates of the two databases (issued for 825 days at install). From 1.1.26
+they raise the same **certificate expiring** alert as a site certificate — 30,
+14 and 7 days ahead — named *database (Postgres) server certificate*, *event
+database (ClickHouse) server certificate* and *internal root CA*. Treat one as
+a planned maintenance item, not a page: the fix is re-issuing from the internal
+CA, and R&D owns the procedure.
+
 ---
 
 ## 6. Backups

@@ -52,6 +52,20 @@ type Monitor struct {
 	// escalation level (medium -> high -> critical) fires once, not every tick.
 	// Single monitor goroutine — no locking needed.
 	lastSev map[string]string
+
+	// internal reads the deployment's own certificates (see internal_certs.go).
+	// nil = site certificates only.
+	internal func(ctx context.Context) []certEntry
+	// raise delivers one alert; a field so tests can observe it without an
+	// alerting engine. Defaults to raiseCertExpiring.
+	raise func(c certEntry, days int64, sev string)
+}
+
+// SetInternalCerts adds the deployment's own certificates — CA files and the
+// certificates the datastores present — to what is checked on every tick. Call
+// before Start.
+func (m *Monitor) SetInternalCerts(read func(ctx context.Context) []certEntry) {
+	m.internal = read
 }
 
 // New builds a cert-expiry Monitor. baseURL + internalSecret are passed in
@@ -116,12 +130,13 @@ func (m *Monitor) tickOnce() {
 
 // tickTracked runs one check and reports what it saw, for the jobs registry.
 func (m *Monitor) tickTracked(ctx context.Context) (string, error) {
-	certs, err := m.fetchCerts(ctx)
+	site, internal, err := m.tick(ctx)
+	note := fmt.Sprintf("%d site and %d internal certificates checked", site, internal)
 	if err != nil {
-		return "", err
+		// The internal ones were still checked; say so next to the failure.
+		return note, fmt.Errorf("data plane inventory unavailable (%s): %w", note, err)
 	}
-	m.tick(ctx)
-	return fmt.Sprintf("%d certificates checked", len(certs)), nil
+	return note, nil
 }
 
 // certEntry is the subset of the data plane's CertMeta JSON we need.
@@ -131,14 +146,34 @@ type certEntry struct {
 	ExpiresAt int64  `json:"expires_at"` // unix seconds; 0 = unknown
 }
 
-func (m *Monitor) tick(ctx context.Context) {
+// tick checks the site certificates the data plane holds and the deployment's
+// own. The two are independent: an unreachable data plane used to end the tick,
+// which would now also skip the certificates that do not depend on it.
+func (m *Monitor) tick(ctx context.Context) (site, internal int, err error) {
 	certs, err := m.fetchCerts(ctx)
 	if err != nil {
 		// Data plane may be down/starting — transient, don't alert on it.
 		m.log.Warn("cert-expiry: fetching cert inventory failed", zap.Error(err))
-		return
+		certs = nil
 	}
-	now := time.Now().Unix()
+	site = len(certs)
+	if m.internal != nil {
+		own := m.internal(ctx)
+		internal = len(own)
+		certs = append(certs, own...)
+	}
+	m.evaluate(certs, time.Now())
+	return site, internal, err
+}
+
+// evaluate raises an alert for each certificate that has entered a new
+// severity bucket since the last tick.
+func (m *Monitor) evaluate(certs []certEntry, at time.Time) {
+	raise := m.raise
+	if raise == nil {
+		raise = m.raiseCertExpiring
+	}
+	now := at.Unix()
 	for _, c := range certs {
 		if c.ExpiresAt <= 0 {
 			continue // unknown expiry (e.g. self-signed) — never alert
@@ -154,7 +189,7 @@ func (m *Monitor) tick(ctx context.Context) {
 		if m.lastSev[c.Domain] == sev {
 			continue // already alerted at this level
 		}
-		m.raiseCertExpiring(c, days, sev)
+		raise(c, days, sev)
 		m.lastSev[c.Domain] = sev
 	}
 }
