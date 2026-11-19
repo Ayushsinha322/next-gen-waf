@@ -832,6 +832,11 @@ pub fn inc_body_buffer_shed() {
     WAF_METRICS.body_buffer_shed_total.inc();
 }
 
+/// Requests shed so far because the body-buffer budget was spent.
+pub fn body_buffer_shed_total() -> u64 {
+    WAF_METRICS.body_buffer_shed_total.get()
+}
+
 /// Increment the counter of WAF events dropped because the in-memory history
 /// buffer was full, and return the new total.
 ///

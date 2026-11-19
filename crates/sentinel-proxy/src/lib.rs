@@ -83,7 +83,7 @@ use sentinel_rules::RuleEngine;
 use sentinel_telemetry::{
     bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
     graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
-    inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
+    inc_blocked, inc_body_buffer_shed, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
     inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits,
     inc_upstream_circuit_rejections, inc_upstream_site_shed, ja4_attempts_total,
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
@@ -225,6 +225,150 @@ async fn buffer_for_scan(mut body: BoxBody, cap: usize) -> ScanBuffer {
                 // message (a checksum, a final status) and the client may rely
                 // on them. They used to be dropped here, so every inspected
                 // response lost them.
+                Err(frame) => {
+                    if let Ok(t) = frame.into_trailers() {
+                        trailers
+                            .get_or_insert_with(header::HeaderMap::new)
+                            .extend(t);
+                    }
+                }
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node-wide budget for request bodies held in memory for inspection
+// ---------------------------------------------------------------------------
+
+/// A request was shed because the node's body-buffer budget was spent. The
+/// gateway answers 503 with Retry-After, like the other by-design sheds.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyBudgetExhausted {
+    pub budget_bytes: usize,
+}
+
+impl std::fmt::Display for BodyBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "body buffer budget exhausted: {} MiB of request bodies already held for inspection",
+            self.budget_bytes / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for BodyBudgetExhausted {}
+
+/// The node's budget, in bytes, for request bodies held in memory while they
+/// are inspected.
+///
+/// Each body is capped (`max_body_size`, 10 MiB by default), but nothing capped
+/// how many were held AT ONCE: a burst of large uploads multiplied the per-body
+/// cap by the concurrency, and the container's memory ceiling — new in 1.1.26 —
+/// would then restart the node with every connection on it. With a budget the
+/// burst is shed 503 instead, and the node stays up for everyone else.
+///
+/// `SENTINEL_BODY_BUFFER_BUDGET_MB` sets it. Otherwise a quarter of the
+/// container's memory limit (cgroup v2 `memory.max` or v1
+/// `memory.limit_in_bytes`) — the rest is the process itself and the copies
+/// inspection makes while decoding — or 1 GiB when there is no limit. Never
+/// below 64 MiB.
+fn body_buffer_budget_bytes() -> (usize, &'static str) {
+    const MIB: usize = 1024 * 1024;
+    if let Some(mb) = std::env::var("SENTINEL_BODY_BUFFER_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return ((mb * MIB).max(64 * MIB), "SENTINEL_BODY_BUFFER_BUDGET_MB");
+    }
+    match cgroup_memory_limit() {
+        Some(limit) => (
+            (limit / 4).max(64 * MIB),
+            "a quarter of the container memory limit",
+        ),
+        None => (1024 * MIB, "default (no container memory limit found)"),
+    }
+}
+
+/// The container's memory limit, if one is set. `None` for "max", for the
+/// near-2^63 value cgroup v1 reports as unlimited, and when not in a cgroup.
+fn cgroup_memory_limit() -> Option<usize> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            return parse_cgroup_limit(&raw);
+        }
+    }
+    None
+}
+
+fn parse_cgroup_limit(raw: &str) -> Option<usize> {
+    let v = raw.trim().parse::<u64>().ok()?;
+    // Anything past 1 PiB is the "no limit" sentinel, not a real ceiling.
+    (v > 0 && v < (1u64 << 50)).then_some(v as usize)
+}
+
+/// The process-wide budget, built (and logged) on first use.
+fn body_budget() -> &'static (Arc<Semaphore>, usize) {
+    static BUDGET: std::sync::OnceLock<(Arc<Semaphore>, usize)> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let (bytes, source) = body_buffer_budget_bytes();
+        info!(
+            budget_mib = bytes / (1024 * 1024),
+            source, "request body buffer budget"
+        );
+        (Arc::new(Semaphore::new(bytes)), bytes)
+    })
+}
+
+/// [`buffer_for_scan`] under a byte budget: every frame takes its size from
+/// `budget` before it is kept, and the permits come back with the result so
+/// the caller can hold them for as long as the bytes are alive.
+///
+/// `None` in the outcome means the budget ran out part-way; what had been read
+/// is released and the request should be shed. Frames are taken without
+/// waiting — waiting would hold the bytes already read, and the connection,
+/// while other requests hold the rest.
+async fn buffer_for_scan_budgeted(
+    mut body: BoxBody,
+    cap: usize,
+    budget: &Arc<Semaphore>,
+) -> Option<(ScanBuffer, Option<tokio::sync::OwnedSemaphorePermit>)> {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut buffered = 0usize;
+    let mut trailers: Option<header::HeaderMap> = None;
+    let mut held: Option<tokio::sync::OwnedSemaphorePermit> = None;
+
+    loop {
+        match body.frame().await {
+            None => return Some((ScanBuffer::Complete(concat_chunks(chunks), trailers), held)),
+            Some(Err(e)) => return Some((ScanBuffer::Error(e), held)),
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => {
+                    let n = u32::try_from(data.len()).ok()?;
+                    if n > 0 {
+                        let permit = Arc::clone(budget).try_acquire_many_owned(n).ok()?;
+                        match held.as_mut() {
+                            Some(h) => h.merge(permit),
+                            None => held = Some(permit),
+                        }
+                    }
+                    buffered += data.len();
+                    chunks.push(data);
+                    if buffered > cap {
+                        return Some((
+                            ScanBuffer::Oversize {
+                                prefix: concat_chunks(chunks),
+                                rest: body,
+                            },
+                            held,
+                        ));
+                    }
+                }
                 Err(frame) => {
                     if let Ok(t) = frame.into_trailers() {
                         trailers
@@ -3621,7 +3765,7 @@ fn gateway_retry_after(e: &anyhow::Error) -> Option<u64> {
         if let Some(u) = c.downcast_ref::<upstream::OriginUnavailable>() {
             return Some(u.retry_after.as_millis().div_ceil(1000).max(1) as u64);
         }
-        if c.is::<upstream::SiteBusy>() {
+        if c.is::<upstream::SiteBusy>() || c.is::<BodyBudgetExhausted>() {
             return Some(1);
         }
     }
@@ -4292,6 +4436,10 @@ async fn proxy_inner(
         .map(|s| s.waf.mode != WafMode::Off && !ctx.allowlisted)
         .unwrap_or(false);
 
+    // Holds this request's share of the node's body-buffer budget for as long
+    // as the buffered bytes can be alive: until the origin has answered, when
+    // this function returns. See `body_budget`.
+    let mut _body_budget_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let boxed_body: BoxBody = if should_inspect_body {
         let max_bytes = site.map(|s| s.waf.max_body_size).unwrap_or(0);
         // should_inspect_body is only true when a site matched.
@@ -4328,18 +4476,30 @@ async fn proxy_inner(
                 // `Limited` did, and — unlike `Limited` — hands back the prefix
                 // plus the untouched remainder so learning mode can forward the
                 // request instead of failing it.
+                let (budget, budget_bytes) = body_budget();
                 match tokio::time::timeout(
                     body_read_timeout(),
-                    buffer_for_scan(body, max_bytes as usize),
+                    buffer_for_scan_budgeted(body, max_bytes as usize, budget),
                 )
                 .await
                 {
+                    Ok(None) => {
+                        inc_body_buffer_shed();
+                        return Err(anyhow::Error::new(BodyBudgetExhausted {
+                            budget_bytes: *budget_bytes,
+                        }));
+                    }
                     // Request trailers are deliberately not forwarded: no rule
                     // reads them, so passing them on would hand the origin
                     // fields that skipped the inspection the body just got.
-                    // (The no-limit `collect` arm below drops them too.)
-                    Ok(ScanBuffer::Complete(b, _trailers)) => b,
-                    Ok(ScanBuffer::Oversize { prefix, rest }) => {
+                    // (The no-limit arm below drops them too.)
+                    Ok(Some((ScanBuffer::Complete(b, _trailers), permit))) => {
+                        _body_budget_permit = permit;
+                        b
+                    }
+                    Ok(Some((ScanBuffer::Oversize { prefix, rest }, permit))) => {
+                        // The prefix is held until it is replayed to the origin.
+                        _body_budget_permit = permit;
                         if let Some(resp) = enforce_request_limit(
                             ctx,
                             site_ref,
@@ -4360,7 +4520,7 @@ async fn proxy_inner(
                         );
                         Bytes::new()
                     }
-                    Ok(ScanBuffer::Error(e)) => {
+                    Ok(Some((ScanBuffer::Error(e), _))) => {
                         return Err(anyhow::anyhow!("collecting request body: {e}"))
                     }
                     Err(_) => {
@@ -4381,8 +4541,32 @@ async fn proxy_inner(
                 }
             }
         } else {
-            match tokio::time::timeout(body_read_timeout(), body.collect()).await {
-                Ok(r) => r.context("collecting request body")?.to_bytes(),
+            // No per-body cap on this site — so the node-wide budget is the only
+            // bound. This was a plain `collect()`, which had none.
+            let (budget, budget_bytes) = body_budget();
+            match tokio::time::timeout(
+                body_read_timeout(),
+                buffer_for_scan_budgeted(body, usize::MAX, budget),
+            )
+            .await
+            {
+                Ok(None) => {
+                    inc_body_buffer_shed();
+                    return Err(anyhow::Error::new(BodyBudgetExhausted {
+                        budget_bytes: *budget_bytes,
+                    }));
+                }
+                Ok(Some((ScanBuffer::Complete(b, _trailers), permit))) => {
+                    _body_budget_permit = permit;
+                    b
+                }
+                // Unreachable with no cap, but answered rather than assumed.
+                Ok(Some((ScanBuffer::Oversize { .. }, _))) => {
+                    return Err(anyhow::anyhow!("collecting request body: exceeded usize"))
+                }
+                Ok(Some((ScanBuffer::Error(e), _))) => {
+                    return Err(anyhow::anyhow!("collecting request body: {e}"))
+                }
                 Err(_) => {
                     ctx.decision = WafDecision::Block;
                     ctx.block_reason = Some("request body read timed out (slow-body)".into());
@@ -15663,6 +15847,94 @@ mod response_scan_tests {
             chunks: chunks.into(),
         }
         .boxed()
+    }
+
+    #[tokio::test]
+    async fn a_budgeted_body_holds_exactly_its_bytes_until_released() {
+        let budget = Arc::new(Semaphore::new(1_000));
+        let body = chunked_body(vec![
+            Bytes::from(vec![b'a'; 300]),
+            Bytes::from(vec![b'b'; 200]),
+        ]);
+        let (scan, permit) = buffer_for_scan_budgeted(body, usize::MAX, &budget)
+            .await
+            .expect("within budget");
+        let ScanBuffer::Complete(bytes, _) = scan else {
+            panic!("not complete")
+        };
+        assert_eq!(bytes.len(), 500);
+        assert_eq!(budget.available_permits(), 500);
+        drop(permit);
+        assert_eq!(budget.available_permits(), 1_000, "released with the bytes");
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_budget_is_refused_and_gives_back_what_it_read() {
+        let budget = Arc::new(Semaphore::new(400));
+        let body = chunked_body(vec![
+            Bytes::from(vec![b'a'; 300]),
+            Bytes::from(vec![b'b'; 200]),
+        ]);
+        assert!(
+            buffer_for_scan_budgeted(body, usize::MAX, &budget)
+                .await
+                .is_none(),
+            "a body that does not fit must be refused, not buffered"
+        );
+        assert_eq!(budget.available_permits(), 400);
+    }
+
+    #[tokio::test]
+    async fn bodies_held_at_once_share_one_budget() {
+        // The per-body cap bounded each body; nothing bounded them together.
+        let budget = Arc::new(Semaphore::new(1_000));
+        let first = chunked_body(vec![Bytes::from(vec![b'a'; 600])]);
+        let held = buffer_for_scan_budgeted(first, usize::MAX, &budget)
+            .await
+            .expect("first fits");
+        let second = chunked_body(vec![Bytes::from(vec![b'b'; 500])]);
+        assert!(buffer_for_scan_budgeted(second, usize::MAX, &budget)
+            .await
+            .is_none());
+        drop(held);
+        let third = chunked_body(vec![Bytes::from(vec![b'c'; 500])]);
+        assert!(buffer_for_scan_budgeted(third, usize::MAX, &budget)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn the_per_body_cap_still_applies_under_a_budget() {
+        let budget = Arc::new(Semaphore::new(10_000));
+        let body = chunked_body(vec![
+            Bytes::from(vec![b'a'; 300]),
+            Bytes::from(vec![b'b'; 300]),
+        ]);
+        let (scan, _permit) = buffer_for_scan_budgeted(body, 400, &budget)
+            .await
+            .expect("budget is ample");
+        assert!(matches!(scan, ScanBuffer::Oversize { .. }));
+    }
+
+    #[test]
+    fn cgroup_limits_are_read_and_unlimited_is_recognised() {
+        assert_eq!(parse_cgroup_limit("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_limit("max\n"), None, "cgroup v2 unlimited");
+        assert_eq!(
+            parse_cgroup_limit("9223372036854771712\n"),
+            None,
+            "cgroup v1 reports unlimited as ~2^63"
+        );
+        assert_eq!(parse_cgroup_limit("0"), None);
+    }
+
+    #[test]
+    fn an_exhausted_body_budget_is_503_retry_after_one_second() {
+        let e = anyhow::Error::new(BodyBudgetExhausted {
+            budget_bytes: 512 * 1024 * 1024,
+        });
+        assert_eq!(gateway_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway_retry_after(&e), Some(1));
     }
 
     #[test]

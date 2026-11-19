@@ -197,19 +197,20 @@ seconds. Then fix it properly. [ROLLBACK.md](ROLLBACK.md) §1.
 ## 6. 503 with Retry-After
 
 A 503 with a Retry-After header is the WAF answering without contacting the
-origin, on purpose. There are three reasons, and the access log's gateway error
+origin, on purpose. There are four reasons, and the access log's gateway error
 field says which (search the request's Support ID in Threat Search):
 
 | Gateway error says | What it means | What to do |
 |---|---|---|
 | **origin unavailable: every upstream server's circuit is open** | The origin failed five requests in a row (refused, unreachable, or no answer within the timeout), so the WAF stopped sending it traffic. It lets **one** request through after 5 seconds to test it, then every 10, 20, 30 seconds while it stays down. The first one that succeeds puts the site straight back in service. | Fix the origin — §2's checklist. The site recovers by itself within 30 s of the origin answering; nothing to reset. |
 | **site at its in-flight limit** | One site has half the node's capacity waiting on its origin — almost always a hung or very slow origin. The other sites keep the rest. | Same: the origin is the problem. `SENTINEL_SITE_MAX_INFLIGHT_REQUESTS` in `.env` changes the limit; raise it only for a site that genuinely holds thousands of slow requests open. |
+| **body buffer budget exhausted** | More request bodies are being held for inspection at once than the node has memory budgeted for (a quarter of the WAF node's memory ceiling — 1 GiB standalone, 512 MiB per node in the 3-node layout). Almost always a burst of large uploads. The node stays up; the uploads that did not fit are refused. | If the uploads are legitimate, raise `SENTINEL_DP_MEM_LIMIT` (the budget follows it) or set `SENTINEL_BODY_BUFFER_BUDGET_MB`. A body larger than the whole budget can never be inspected — lower that site's maximum body size instead. |
 | *(no gateway error; body says "server at capacity")* | The whole node has more requests in flight than it accepts at once. | A genuine traffic spike or attack → the WAF is doing its job; look at Events and Traffic. Undersized for normal load → escalate to R&D with the numbers from `/metrics`. |
 
 Health, readiness and metrics endpoints are never shed, so monitoring keeps
 working. On `/metrics` the three are counted separately:
-`sentinel_upstream_circuit_rejections_total`, `sentinel_upstream_site_shed_total`
-and `sentinel_load_shed_requests_total`.
+`sentinel_upstream_circuit_rejections_total`, `sentinel_upstream_site_shed_total`,
+`sentinel_body_buffer_shed_total` and `sentinel_load_shed_requests_total`.
 
 Before 1.1.27 a dead origin produced a slow **502** on every request instead —
 each visitor waited out the connect timeout to find out.
