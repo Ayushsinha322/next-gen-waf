@@ -19,6 +19,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 const (
@@ -111,7 +112,7 @@ func (m *Monitor) Start() {
 		tickInterval, func(ctx context.Context) (string, error) { return m.tickTracked(ctx) })
 	m.log.Info("node-health monitor started",
 		zap.Duration("down_after", m.downAfter))
-	go m.loop()
+	safego.Loop(m.log, "nodehealth.monitor", m.loop)
 }
 
 // Stop halts the monitor.

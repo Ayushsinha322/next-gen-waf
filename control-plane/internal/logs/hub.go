@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // Source identifies where an Entry came from. It exists so that fabricated data
@@ -271,10 +273,10 @@ func NewHub() *Hub {
 	//
 	// Node directories appear when their container starts, which can be after
 	// this process, so rescan rather than globbing once at boot.
-	go h.discoverNodeLogs(dir, kinds)
+	safego.Loop(nil, "logs.discover", func() { h.discoverNodeLogs(dir, kinds) })
 
-	go h.runBucketSampler()
-	go h.runMemSampler()
+	safego.Loop(nil, "logs.bucket-sampler", h.runBucketSampler)
+	safego.Loop(nil, "logs.mem-sampler", h.runMemSampler)
 
 	return h
 }
@@ -1003,7 +1005,9 @@ func p99Of(cp []float64) float64 {
 // On startup the tailer seeks to the current end of file so only new events
 // are emitted — not historical ones already on disk before the process started.
 func (h *Hub) tailKind(kind, path string) {
-	go func() {
+	// Restarted after a panic: the tailer then seeks to the end of the file
+	// again, so the line that broke it is skipped rather than re-read.
+	safego.Loop(nil, "logs.tail."+kind, func() {
 		var offset int64
 		var pending []byte
 		started := false
@@ -1083,7 +1087,7 @@ func (h *Hub) tailKind(kind, path string) {
 				h.publish(Entry{Kind: kind, Data: data})
 			}
 		}
-	}()
+	})
 }
 
 // ---------------------------------------------------------------------------

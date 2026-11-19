@@ -26,6 +26,7 @@ import (
 	chreader "github.com/your-org/sentinel-waf/control-plane/internal/clickhouse"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 const (
@@ -89,7 +90,7 @@ func (m *Monitor) Start() {
 	m.log.Info("disk-pressure monitor started",
 		zap.Duration("interval", m.interval),
 		zap.Float64("threshold_pct", m.threshold))
-	go m.loop()
+	safego.Loop(m.log, "diskmon.monitor", m.loop)
 }
 
 // Stop halts the monitor.

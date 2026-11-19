@@ -2,6 +2,7 @@ package threatintel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // maxFeedBytes caps a single feed response to protect the aggregator from a
@@ -127,6 +129,10 @@ func (a *Aggregator) SourceNames() []string {
 	return names
 }
 
+// errSourcePanicked is the result recorded for a source whose fetch or parse
+// panicked (the panic itself is reported by safego).
+var errSourcePanicked = errors.New("source panicked")
+
 // Start runs an immediate refresh, then refreshes on the configured interval
 // until Stop is called. Non-blocking.
 func (a *Aggregator) Start(ctx context.Context) {
@@ -134,7 +140,7 @@ func (a *Aggregator) Start(ctx context.Context) {
 		a.log.Warn("threat-intel disabled — no database")
 		return
 	}
-	go a.run(ctx)
+	safego.Loop(a.log, "threatintel.aggregator", func() { a.run(ctx) })
 	a.log.Info("threat-intel aggregator started",
 		zap.Strings("sources", a.SourceNames()),
 		zap.Duration("interval", a.interval))
@@ -212,6 +218,11 @@ func (a *Aggregator) RefreshOnce(ctx context.Context) (int, error) {
 		wg.Add(1)
 		go func(i int, src Source) {
 			defer wg.Done()
+			// These parsers read bodies the control plane does not control. A
+			// panic in one is that source failing — recorded as such, so the
+			// merge below never mistakes it for a feed that returned nothing.
+			results[i] = result{src: src, err: errSourcePanicked}
+			defer safego.Recover(a.log, "threatintel.source."+src.Name)
 			iocs, err := a.fetchSource(ctx, src)
 			results[i] = result{src: src, iocs: iocs, err: err}
 		}(i, src)

@@ -28,6 +28,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"go.uber.org/zap"
 
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 	"github.com/your-org/sentinel-waf/control-plane/internal/version"
 )
 
@@ -2918,6 +2919,10 @@ func handleLogsStream(c *gin.Context, jwtSvc *auth.JWTService, enf *rbac.Enforce
 		select {
 		case <-notify:
 			return
+		case <-streams.done():
+			// Shutting down. This response never goes idle, so the server
+			// could not drain while it was open (see shutdown.go).
+			return
 		case <-keepAlive.C:
 			comment("keep-alive")
 		case entry, ok := <-ch:
@@ -3119,13 +3124,13 @@ func writeAuditEntry(c *gin.Context, store *db.Store, hub *logs.Hub, req *db.Wri
 		// before this write finishes, which would cancel c.Request.Context()
 		// and silently drop the audit row. Use a fresh bounded context so the
 		// audit entry is durably persisted regardless of response lifecycle.
-		go func() {
+		safego.Go(nil, "audit.write", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := store.WriteAuditLog(ctx, reqCopy, auditHMACKey()); err != nil {
 				zap.L().Warn("audit write failed", zap.String("action", reqCopy.Action), zap.Error(err))
 			}
-		}()
+		})
 	}
 }
 

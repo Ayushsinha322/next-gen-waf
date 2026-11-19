@@ -27,6 +27,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/mailer"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // ---------------------------------------------------------------------------
@@ -332,7 +333,7 @@ func NewDeliverer(store *db.Store, ch *clickhouse.Client, mail func() *mailer.Ma
 
 // Start: first pass two minutes after boot (let ClickHouse come up), then hourly.
 func (d *Deliverer) Start() {
-	go func() {
+	safego.Loop(d.log, "reports.deliverer", func() {
 		select {
 		case <-d.done:
 			return
@@ -349,7 +350,7 @@ func (d *Deliverer) Start() {
 				d.track()
 			}
 		}
-	}()
+	})
 }
 
 func (d *Deliverer) Stop() { d.once.Do(func() { close(d.done) }) }

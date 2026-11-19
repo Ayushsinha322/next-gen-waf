@@ -17,6 +17,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,12 @@ func handleUnblockIP(c *gin.Context, enf *rbac.Enforcer, store *db.Store, hub *l
 		go func(i int, t string) {
 			defer wg.Done()
 			results[i] = nodeResult{Target: t}
+			// gin.Recovery covers the handler's goroutine, not this one.
+			defer func() {
+				if safego.Caught(nil, "blocks.unblock-fanout", recover()) {
+					results[i].Error = "internal error"
+				}
+			}()
 			req, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodDelete, t+"/api/v1/internal/blocks/"+ip.String(), nil)
 			setInternalAuth(req)
 			r, err := blocksHTTPClient.Do(req)

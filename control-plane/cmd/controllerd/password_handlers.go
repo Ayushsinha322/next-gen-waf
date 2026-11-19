@@ -19,6 +19,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/mailer"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // ---------------------------------------------------------------------------
@@ -187,7 +188,7 @@ func startSessionEpochRefresh(ctx context.Context, store *db.Store, log *zap.Log
 		}
 	}
 	load()
-	go func() {
+	safego.Loop(log, "auth.session-epoch-refresh", func() {
 		t := time.NewTicker(sessionEpochRefreshInterval)
 		defer t.Stop()
 		for {
@@ -198,7 +199,7 @@ func startSessionEpochRefresh(ctx context.Context, store *db.Store, log *zap.Log
 				load()
 			}
 		}
-	}()
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -410,9 +411,9 @@ func handleForgotPassword(c *gin.Context, store *db.Store, hub *logs.Hub, log *z
 	}
 
 	sourceIP := c.ClientIP()
-	go func() {
+	safego.Go(log, "mail.password-reset", func() {
 		_ = sendResetMail(m, acct, link, expiresAt, false, sourceIP, log)
-	}()
+	})
 	respond()
 }
 
@@ -498,7 +499,7 @@ func handleResetPassword(c *gin.Context, store *db.Store, hub *logs.Hub, log *za
 	sourceIP := c.ClientIP()
 	userEmail := acct.Email
 	userName := acct.Name
-	go func() {
+	safego.Go(log, "mail.password-changed", func() {
 		if m.Config().Configured() && userEmail != "" {
 			msg := mailer.ChangedEmail(userName, sourceIP, time.Now())
 			msg.To = userEmail
@@ -507,7 +508,7 @@ func handleResetPassword(c *gin.Context, store *db.Store, hub *logs.Hub, log *za
 			}
 		}
 		notifySecurityContact(m, userEmail, sourceIP, initiatedBy, log)
-	}()
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,

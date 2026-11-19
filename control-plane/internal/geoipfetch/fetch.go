@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // FileName is what the data planes look for (SENTINEL_GEOIP_DB defaults to it).
@@ -72,7 +73,7 @@ func (f *Fetcher) Start() {
 		f.log.Info("geoip fetcher disabled — SENTINEL_GEOIP_DIR not set")
 		return
 	}
-	go func() {
+	safego.Loop(f.log, "geoip.fetcher", func() {
 		f.tick()
 		t := time.NewTicker(24 * time.Hour)
 		defer t.Stop()
@@ -84,7 +85,7 @@ func (f *Fetcher) Start() {
 				f.tick()
 			}
 		}
-	}()
+	})
 }
 
 func (f *Fetcher) Stop() { close(f.done) }

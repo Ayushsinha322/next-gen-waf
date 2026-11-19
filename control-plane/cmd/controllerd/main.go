@@ -30,6 +30,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/nodehealth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
 	"github.com/your-org/sentinel-waf/control-plane/internal/reports"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 	"github.com/your-org/sentinel-waf/control-plane/internal/settings"
 	"github.com/your-org/sentinel-waf/control-plane/internal/threatintel"
 	"go.uber.org/zap"
@@ -294,14 +295,7 @@ func run() error {
 			// JWT revocation: consult the shared denylist on every Validate so a
 			// logout kills the session cluster-wide. Fail OPEN on a DB error (a
 			// blip must not lock everyone out). Prune expired rows hourly.
-			jwtSvc.SetRevocationChecker(func(jti string) bool {
-				revoked, err := store.IsTokenRevoked(context.Background(), jti)
-				if err != nil {
-					log.Warn("token revocation check failed (fail-open)", zap.Error(err))
-					return false
-				}
-				return revoked
-			})
+			jwtSvc.SetRevocationChecker(revocationChecker(store.IsTokenRevoked, revocationCheckTimeout, log))
 
 			// Session cut-off: a password reset invalidates every token minted
 			// before it. The denylist above cannot express that — it needs a jti,
@@ -318,7 +312,7 @@ func run() error {
 			// Reclaim spent and expired reset tokens alongside the existing
 			// revoked-token prune, so a busy deployment does not accumulate
 			// dead single-use rows forever.
-			go func() {
+			safego.Loop(log, "auth.reset-token-prune", func() {
 				t := time.NewTicker(time.Hour)
 				defer t.Stop()
 				for {
@@ -331,8 +325,8 @@ func run() error {
 					}
 					cancel()
 				}
-			}()
-			go func() {
+			})
+			safego.Loop(log, "auth.revoked-token-prune", func() {
 				t := time.NewTicker(time.Hour)
 				defer t.Stop()
 				for {
@@ -345,7 +339,7 @@ func run() error {
 						}
 					}
 				}
-			}()
+			})
 		}
 	}
 
@@ -472,28 +466,33 @@ func run() error {
 		} else {
 			// Follow Raft leadership: start the set when this node becomes leader,
 			// stop it when leadership moves elsewhere.
-			go func() {
+			// `stop` lives outside the loop body so a restart after a panic
+			// still knows a set is running, and it is cleared BEFORE it is
+			// called: a stop that panics half-way must not be called again
+			// (each monitor's Stop closes a channel).
+			var stop func()
+			safego.Loop(log, "leader.monitor-supervisor", func() {
 				ticker := time.NewTicker(1 * time.Second)
 				defer ticker.Stop()
-				var stop func()
 				for {
 					select {
 					case <-ctx.Done():
-						if stop != nil {
-							stop()
+						if s := stop; s != nil {
+							stop = nil
+							s()
 						}
 						return
 					case <-ticker.C:
 						leader := cl.IsLeader()
 						if leader && stop == nil {
 							stop = startMonitors()
-						} else if !leader && stop != nil {
-							stop()
+						} else if s := stop; !leader && s != nil {
 							stop = nil
+							s()
 						}
 					}
 				}
-			}()
+			})
 		}
 	}
 
@@ -578,7 +577,9 @@ func run() error {
 		if !ready {
 			code = http.StatusServiceUnavailable
 		}
-		c.JSON(code, gin.H{"ready": ready, "checks": checks})
+		// Not a readiness condition — a node that contained a panic still
+		// serves — but the one number that says a background job is unwell.
+		c.JSON(code, gin.H{"ready": ready, "checks": checks, "background_panics": safego.Panics()})
 	})
 
 	// ── UI is served by the Next.js dashboard, never from here ────────────────
@@ -896,13 +897,22 @@ func run() error {
 	sig := <-sigCh
 	log.Info("shutting down", zap.String("signal", sig.String()))
 
-	if pool != nil {
-		pool.Close()
+	// Order matters — see shutdown.go.
+	steps := shutdownSteps{
+		log:          log,
+		stopStreams:  streams.stop,
+		httpShutdown: httpSrv.Shutdown,
+		httpClose:    httpSrv.Close,
+		httpGrace:    defaultHTTPGrace,
+		poolGrace:    defaultPoolGrace,
 	}
-
-	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return httpSrv.Shutdown(shutCtx)
+	if cl != nil {
+		steps.stopElector = cl.Stop // idempotent: the deferred Stop above is then a no-op
+	}
+	if pool != nil {
+		steps.closePool = pool.Close
+	}
+	return steps.run()
 }
 
 func envOrDefault(key, def string) string {

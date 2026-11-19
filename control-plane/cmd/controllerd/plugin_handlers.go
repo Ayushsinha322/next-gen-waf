@@ -22,6 +22,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/auth"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/rbac"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // Upload limits. A WASM plugin is tens of KB to a couple of MB; these bounds are
@@ -583,12 +584,12 @@ func auditPlugin(store *db.Store, tenantID, userID string, c *gin.Context, actio
 		UserAgent:   &ua,
 		Diff:        raw,
 	}
-	go func() {
+	safego.Go(nil, "audit.write", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := store.WriteAuditLog(ctx, req, auditHMACKey()); err != nil {
 			zap.L().Warn("plugin audit write failed",
 				zap.String("action", req.Action), zap.Error(err))
 		}
-	}()
+	})
 }

@@ -163,6 +163,40 @@ func TestRefreshOnce_AllSourcesFail(t *testing.T) {
 	}
 }
 
+// A feed parser that panics on what it was served. Before the fetch goroutines
+// were guarded this ended the control plane process — and the test binary, so
+// this test completing at all is half of what it proves.
+func TestRefreshOnce_APanickingSourceIsAFailedSource(t *testing.T) {
+	torSrv := serve("7.7.7.7\n", 200)
+	defer torSrv.Close()
+	fs := &fakeStore{}
+	agg := New(fs, Config{Enabled: true, HTTPTimeout: 5 * time.Second}, zap.NewNop())
+	panics := Source{Name: "broken", Provider: func() ([]db.IOC, error) {
+		var feed map[string][]string
+		feed["ips"] = nil // nil map write
+		return nil, nil
+	}}
+	agg.sources = []Source{
+		{Name: "tor", URL: torSrv.URL, Category: "tor_exit", Confidence: 50, TTL: time.Hour, Parse: parseTorExitList},
+		panics,
+	}
+
+	if _, err := agg.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("one panicking source must not abort the refresh: %v", err)
+	}
+	if _, ok := fs.find("ip", "7.7.7.7"); !ok {
+		t.Error("the healthy source's IOC must still be upserted")
+	}
+
+	// Alone, it must count as a FAILED source. Were the panic recorded as "the
+	// feed returned nothing", this refresh would succeed with zero indicators
+	// and the reconciler would be free to expire what the source had supplied.
+	agg.sources = []Source{panics}
+	if _, err := agg.RefreshOnce(context.Background()); err == nil {
+		t.Fatal("a source that panicked was counted as a source that succeeded")
+	}
+}
+
 func TestConfigSourcesDisable(t *testing.T) {
 	cfg := Config{TorURL: "x", FeodoURL: "off", URLhausURL: "-", STIXURL: ""}
 	names := map[string]bool{}

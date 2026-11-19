@@ -25,6 +25,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/alerting"
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 const (
@@ -86,7 +87,7 @@ func (m *Monitor) Start() {
 	m.log.Info("cert-expiry monitor started",
 		zap.Duration("interval", m.interval),
 		zap.String("data_plane", m.baseURL))
-	go m.loop()
+	safego.Loop(m.log, "certmon.monitor", m.loop)
 }
 
 // Stop halts the monitor.

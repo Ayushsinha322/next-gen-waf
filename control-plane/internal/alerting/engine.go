@@ -19,6 +19,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/logs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/notify"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // Config tunes the alert-generation thresholds. Zero values fall back to
@@ -134,10 +135,10 @@ func (e *Engine) Start() {
 		return
 	}
 	ch := e.hub.Subscribe()
-	go e.loop(ch)
-	go e.dispatchWorker()
-	go e.janitor()
-	go e.autoResolver()
+	safego.Loop(e.log, "alerting.events", func() { e.loop(ch) })
+	safego.Loop(e.log, "alerting.dispatch", e.dispatchWorker)
+	safego.Loop(e.log, "alerting.janitor", e.janitor)
+	safego.Loop(e.log, "alerting.auto-resolve", e.autoResolver)
 	e.log.Info("alert engine started",
 		zap.Int("spike_threshold", e.cfg.SpikeThreshold),
 		zap.Int("offender_threshold", e.cfg.OffenderThreshold),

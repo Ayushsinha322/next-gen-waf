@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // Severity rank for min-severity gating. Higher = more severe.
@@ -114,6 +116,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert, channels []Channel) 
 		wg.Add(1)
 		go func(ch Channel) {
 			defer wg.Done()
+			defer safego.Recover(nil, "notify.send")
 			cctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			err := send(cctx, ch, a)

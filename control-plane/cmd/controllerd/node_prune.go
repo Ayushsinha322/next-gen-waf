@@ -12,6 +12,7 @@ import (
 	"github.com/your-org/sentinel-waf/control-plane/internal/db"
 	"github.com/your-org/sentinel-waf/control-plane/internal/jobs"
 	"github.com/your-org/sentinel-waf/control-plane/internal/leader"
+	"github.com/your-org/sentinel-waf/control-plane/internal/safego"
 )
 
 // Stale nodes.
@@ -102,7 +103,7 @@ func startNodePrune(store *db.Store, cl *leader.Elector, log *zap.Logger) func()
 			return note, err
 		})
 	}
-	go func() {
+	safego.Loop(log, "nodes.prune", func() {
 		// First pass shortly after boot, so an upgrade's own ghost rows (the
 		// identities this very restart replaced) are gone within minutes, not
 		// after the first hourly tick.
@@ -122,6 +123,6 @@ func startNodePrune(store *db.Store, cl *leader.Elector, log *zap.Logger) func()
 				tick()
 			}
 		}
-	}()
+	})
 	return func() { close(done); jobs.Unregister("nodes.prune") }
 }
