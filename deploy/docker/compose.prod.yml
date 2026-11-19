@@ -75,6 +75,12 @@ services:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}postgres:16-alpine
     logging: *logging
     restart: unless-stopped
+    # Docker's default is 10 s and then SIGKILL. Postgres writes a shutdown
+    # checkpoint first; killed mid-way, the next start is crash recovery.
+    stop_grace_period: 60s
+    # A ceiling, not a budget — see the note on the dataplane service. Postgres
+    # here runs the stock 128 MB shared_buffers and a few dozen connections.
+    mem_limit: ${SENTINEL_PG_MEM_LIMIT:-2g}
     # TLS is served, not optional. Without these flags the server offers no TLS at
     # all, so every client DSN had to say sslmode=disable and all database traffic —
     # session tokens, API-key hashes, audit rows, tenant config, and the handshake
@@ -137,7 +143,15 @@ services:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}valkey/valkey:8-alpine
     logging: *logging
     restart: unless-stopped
-    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    # It holds rate-limit buckets and nothing else, every key with a TTL, so
+    # under memory pressure the right answer is to forget the least recently
+    # used bucket (that client's allowance resets) — not to be OOM-killed and
+    # forget all of them. maxmemory therefore sits BELOW the container ceiling;
+    # raise the two together.
+    command: ["valkey-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "${SENTINEL_VALKEY_MAXMEMORY:-384mb}",
+              "--maxmemory-policy", "allkeys-lru"]
+    mem_limit: ${SENTINEL_VALKEY_MEM_LIMIT:-512m}
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
@@ -169,6 +183,9 @@ services:
     image: ${SENTINEL_THIRDPARTY_PREFIX:-}clickhouse/clickhouse-server:26.3.35.3-alpine
     logging: *logging
     restart: unless-stopped
+    # Time to flush parts and stop merges cleanly; the 10 s default is a
+    # SIGKILL in the middle of both on a busy store.
+    stop_grace_period: 60s
     # 1536m is NOT enough: at that limit ClickHouse's own internal-table merges
     # (system.text_log) get OOM-killed during startup, and the container
     # crash-loops indefinitely — observed ~24k restarts on the deploy VM
@@ -274,6 +291,12 @@ services:
     hostname: ${SENTINEL_CP_HOSTNAME:-sentinel-controlplane}
     logging: *logging
     restart: unless-stopped
+    # Sized to the control plane's own shutdown (cmd/controllerd/shutdown.go):
+    # resign leadership, drain HTTP for 10 s, close the pool within 5 s. At the
+    # 10 s default the leader was SIGKILLed before it could resign.
+    stop_grace_period: 30s
+    # A ceiling, not a budget (see the dataplane service). It idles at ~20 MB.
+    mem_limit: ${SENTINEL_CP_MEM_LIMIT:-512m}
     # root so it can write the shared NDJSON log volume (hardened via K8s
     # securityContext later). The control-plane hub reads what the proxy writes.
     user: "0:0"
@@ -439,6 +462,24 @@ services:
     hostname: ${SENTINEL_DP_HOSTNAME:-sentinel-dataplane}
     logging: *logging
     restart: unless-stopped
+    # On SIGTERM the data plane fails /readyz, stops accepting, and waits up to
+    # 25 s (SENTINEL_DRAIN_GRACE_SECS) for in-flight requests. Docker's default
+    # grace is 10 s, so every upload, slow response or WebSocket older than that
+    # was cut by SIGKILL on each restart and each roll — the drain existed and
+    # was never given the time to run. Kubernetes already had 30 s
+    # (deploy/k8s/ha/10-dataplane.yaml); compose had nothing. Raise this with
+    # SENTINEL_DRAIN_GRACE_SECS, never the drain alone.
+    # deploy/ci/check-compose-parses-clean.sh holds the two together.
+    stop_grace_period: 30s
+    # A CEILING, NOT A BUDGET. No container but ClickHouse had a limit, so one
+    # that grew without bound took memory from every other and the kernel then
+    # chose what to kill — possibly Postgres. With a ceiling the container that
+    # grew is the one restarted. It is set far above normal use (a node idles
+    # near 110 MB) because a ceiling set too low is itself an outage: this is
+    # the only data plane on a standalone host, so it gets 4g. Request bodies
+    # are buffered up to 10 MiB each for inspection, which is what a flood of
+    # large uploads would spend it on.
+    mem_limit: ${SENTINEL_DP_MEM_LIMIT:-4g}
     user: "0:0"
     # Kernel XDP needs these to load/attach the BPF program and its maps.
     # Without them the data plane simply falls back to the userspace software
@@ -682,6 +723,8 @@ services:
       retries: 4
     logging: *logging
     restart: unless-stopped
+    # A ceiling, not a budget (see the dataplane service). It idles at ~65 MB.
+    mem_limit: ${SENTINEL_DASHBOARD_MEM_LIMIT:-512m}
     depends_on:
       controlplane: { condition: service_started }
     environment:

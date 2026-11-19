@@ -52,6 +52,13 @@ x-wafnode: &wafnode
   image: ${SENTINEL_IMAGE_PREFIX:-sentinel}/dataplane:${SENTINEL_VERSION:-latest}
   logging: *logging
   restart: unless-stopped
+  # Both from the `dataplane` service in compose.prod.yml, where the reasons
+  # are — and the fourth setting that had to be copied here by hand because a
+  # fix to that service does not reach this anchor (see the notes below).
+  # 30 s covers the 25 s drain. The ceiling is 2g per node rather than the
+  # standalone 4g: three nodes share this host and split the traffic.
+  stop_grace_period: 30s
+  mem_limit: ${SENTINEL_DP_MEM_LIMIT:-2g}
   user: "0:0"
   # Kernel XDP needs these to load and attach the BPF program and its maps.
   # Their absence is why every node in this fleet reported

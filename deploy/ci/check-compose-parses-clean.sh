@@ -513,6 +513,134 @@ check_node_identity() {
 }
 check_node_identity
 
+# ── A node must be given the time to stop, and a ceiling on its memory ───────
+#
+# The data plane drains on SIGTERM: it fails /readyz, stops accepting, and waits
+# up to 25 s for in-flight requests. Compose never told Docker to wait, so the
+# default applied — 10 s, then SIGKILL — and every request older than that was
+# cut on every restart and every roll. The drain was real code that never got to
+# finish. The control plane's leader had the same shape: SIGKILLed before it
+# could resign. Rolls looked clean because the probes are short requests.
+#
+# And nothing but ClickHouse had a memory limit, so one container that grew
+# could starve the host and leave the kernel to choose what to kill.
+#
+# Both are settings on a service, and this repository has lost such a setting
+# three times already by adding it to compose.prod.yml's one `dataplane` and not
+# to the anchor waf1/waf2/waf3 are built from. So this reads the RENDERED
+# topologies and goes by image, not by service name: whatever runs the data
+# plane or control plane image, under any name, must carry both.
+#
+# The data plane's grace is compared with the drain default in the binary's
+# source rather than a number restated here — raise one without the other and
+# this fails.
+check_nodes_stop_and_are_bounded() {
+  printf '\n%s==> every node is given time to stop, and a memory ceiling%s\n\n' "$B" "$R"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '  %s✗%s jq is not installed — the compose files were NOT checked\n' "$RED" "$R"
+    fail=$((fail + 1)); return
+  fi
+
+  local src=crates/sentinel-proxy/src/lib.rs drain
+  drain=$(sed -n '/^fn drain_grace()/,/^}/p' "$src" 2>/dev/null \
+          | sed -n 's/.*\.unwrap_or(\([0-9][0-9]*\)).*/\1/p' | head -1)
+  if [[ -z "$drain" ]]; then
+    printf '  %s✗%s could not read the drain default from %s — drain_grace() moved; fix this check\n' "$RED" "$R" "$src"
+    fail=$((fail + 1)); return
+  fi
+  # cmd/controllerd/shutdown.go: resign (2 × 5 s) + HTTP drain 10 s + pool 5 s.
+  local cp_need=25 db_need=60
+
+  # secs <compose duration> — "30s", "1m0s", "1m30s", "2m" → seconds; "" → 0.
+  secs() {
+    local d="$1" m=0 s=0
+    [[ "$d" =~ ([0-9]+)m ]] && m="${BASH_REMATCH[1]}"
+    [[ "$d" =~ ([0-9]+)s ]] && s="${BASH_REMATCH[1]}"
+    printf '%s' $(( m * 60 + s ))
+  }
+
+  local label files envf rendered problems=() seen_dp=0 seen_cp=0
+  for label in standalone ha; do
+    case "$label" in
+      standalone) files=(-f deploy/docker/compose.prod.yml) ;;
+      ha)         files=(-f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml
+                         -f deploy/docker/compose.ha.yml) ;;
+    esac
+    envf=$(mktemp); synth_env "$envf" "${IVARS[@]}" "${HVARS[@]}"
+    # The sized variables must not mask a missing default: drop them so the
+    # compose file's own `:-` values are what is rendered.
+    sed -i '/_MEM_LIMIT=/d; /_MAXMEMORY=/d' "$envf"
+    rendered=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file "$envf" "${files[@]}" \
+               config --format json 2>/dev/null) || rendered=""
+    rm -f "$envf"
+    if [[ -z "$rendered" ]]; then
+      printf '  %s✗%s could not render the %s topology\n' "$RED" "$R" "$label"
+      fail=$((fail + 1)); continue
+    fi
+
+    # Every field is non-empty by construction ("-" / "0" stand for absent):
+    # tab is IFS whitespace, so `read` collapses an empty field and shifts the
+    # ones after it — an unset grace would be read as the memory limit.
+    local name image grace mem cmd g
+    while IFS=$'\t' read -r name image grace mem cmd; do
+      [[ -n "$name" ]] || continue
+      g=$(secs "$grace"); [[ "$grace" != "-" ]] || grace=unset
+      case "$image" in
+        */dataplane:*)
+          seen_dp=$((seen_dp + 1))
+          (( g > drain )) || problems+=("[$label] $name: stop_grace_period ${grace} does not cover the ${drain}s drain — in-flight requests are SIGKILLed on every restart")
+          [[ "$mem" != "0" ]] || problems+=("[$label] $name: no mem_limit")
+          ;;
+        */controlplane:*)
+          seen_cp=$((seen_cp + 1))
+          (( g > cp_need )) || problems+=("[$label] $name: stop_grace_period ${grace} is not above ${cp_need}s — the leader is SIGKILLed before it can resign")
+          [[ "$mem" != "0" ]] || problems+=("[$label] $name: no mem_limit")
+          ;;
+        */dashboard:*)
+          [[ "$mem" != "0" ]] || problems+=("[$label] $name: no mem_limit")
+          ;;
+      esac
+      case "$name" in
+        postgres|clickhouse)
+          (( g >= db_need )) || problems+=("[$label] $name: stop_grace_period ${grace} is under ${db_need}s — SIGKILL mid-checkpoint means crash recovery on the next start")
+          [[ "$mem" != "0" ]] || problems+=("[$label] $name: no mem_limit")
+          ;;
+        redis)
+          [[ "$mem" != "0" ]] || problems+=("[$label] $name: no mem_limit")
+          # A ceiling without maxmemory turns "forget one bucket" into
+          # "OOM-killed, forget all of them".
+          grep -q -- '--maxmemory' <<<"$cmd" \
+            || problems+=("[$label] $name: mem_limit without --maxmemory — it would be killed at the ceiling instead of evicting")
+          ;;
+      esac
+    done < <(jq -r '.services | to_entries[]
+                    | [ .key,
+                        (.value.image // "-"),
+                        (.value.stop_grace_period // "-" | tostring),
+                        (.value.mem_limit // "0" | tostring),
+                        ((.value.command // ["-"]) | map(tostring) | join(" ")) ]
+                    | @tsv' <<<"$rendered")
+  done
+
+  # Guard the guard: if the image names change, the loop above matches nothing
+  # and would pass with nothing checked.
+  (( seen_dp >= 4 )) || problems+=("only $seen_dp data-plane service(s) recognised across both topologies, expected 4 (dataplane, waf1-3) — the image match in this check is stale")
+  (( seen_cp >= 4 )) || problems+=("only $seen_cp control-plane service(s) recognised across both topologies, expected 4 — the image match in this check is stale")
+
+  if (( ${#problems[@]} == 0 )); then
+    printf '  %s✓%s %d data-plane and %d control-plane services: grace covers the %ss drain / the leader hand-off, all bounded\n' \
+      "$GRN" "$R" "$seen_dp" "$seen_cp" "$drain"
+    printf '  %s✓%s postgres and clickhouse get %ss to stop; valkey evicts below its ceiling\n' "$GRN" "$R" "$db_need"
+  else
+    local msg
+    for msg in "${problems[@]}"; do
+      printf '  %s✗%s %s\n' "$RED" "$R" "$msg"
+      fail=$((fail + 1))
+    done
+  fi
+}
+check_nodes_stop_and_are_bounded
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"

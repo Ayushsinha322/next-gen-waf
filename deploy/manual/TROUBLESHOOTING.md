@@ -290,6 +290,32 @@ The event database (ClickHouse) is capped at 6 GB and **crash-loops indefinitely
 when less than about 2 GB is free on the host. An undersized VM does not produce a
 slow WAF; it produces this. The requirement is 16 GB and it is real.
 
+**Then check whether the container hit its own ceiling.** From 1.1.26 every
+service has a memory ceiling, so that one which grows is restarted instead of
+taking memory from the rest:
+
+```bash
+docker inspect -f '{{.Name}} oom-killed={{.State.OOMKilled}} restarts={{.RestartCount}}' \
+  $(docker compose -p sentinel ps -q)
+```
+
+`oom-killed=true` on one service, with memory still free on the host, means that
+service's ceiling is too low for this site's traffic. Raise it in `.env` and run
+`docker compose up -d` for that service:
+
+| Service | `.env` key | Default |
+|---|---|---|
+| WAF node | `SENTINEL_DP_MEM_LIMIT` | `4g` standalone, `2g` per node in the 3-node layout |
+| Control plane | `SENTINEL_CP_MEM_LIMIT` | `512m` |
+| Console | `SENTINEL_DASHBOARD_MEM_LIMIT` | `512m` |
+| Postgres | `SENTINEL_PG_MEM_LIMIT` | `2g` |
+| Valkey (rate-limit counters) | `SENTINEL_VALKEY_MEM_LIMIT`, with `SENTINEL_VALKEY_MAXMEMORY` kept below it | `512m` / `384mb` |
+| Event database | `CLICKHOUSE_MEM_LIMIT` | sized by the installer, 6 GB minimum |
+
+A WAF node that is OOM-killed under a flood of large uploads is the ceiling doing
+its job; one that is killed in ordinary traffic is a ceiling to raise — and worth
+reporting to R&D with the node's memory graph.
+
 Other causes:
 
 | Symptom in the logs | Cause |

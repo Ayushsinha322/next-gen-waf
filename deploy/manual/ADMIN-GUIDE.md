@@ -231,7 +231,14 @@ Everything should be `Up`, and the ones with health checks should say `healthy`.
 
 > **A container stuck restarting is nearly always memory.** The event database is
 > capped at 6 GB and crash-loops when the host runs short. Check `free -g` before
-> looking anywhere else.
+> looking anywhere else. Every other service has its own ceiling too, and
+> `docker inspect` says whether it was reached — Troubleshooting §10 has the
+> command and the `.env` key for each.
+
+Stopping is not instant, by design. A WAF node is given 30 seconds to finish the
+requests it is serving, the control plane 30 seconds to hand leadership over, and
+the two databases 60 seconds to write their data out. `docker compose stop` and
+an upgrade wait for that; do not `docker kill` a container that is "taking long".
 
 ### Endpoints for your monitoring system
 

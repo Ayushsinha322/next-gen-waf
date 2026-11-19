@@ -123,6 +123,11 @@ services:
     logging: *logging
     hostname: cp2
     restart: unless-stopped
+    # Same two settings as node 1 (compose.prod.yml `controlplane`, where the
+    # reasons are). They are restated because cp2/cp3 are whole services, not
+    # overrides: a setting added only to node 1 never reaches them.
+    stop_grace_period: 30s
+    mem_limit: ${SENTINEL_CP_MEM_LIMIT:-512m}
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
@@ -159,6 +164,11 @@ services:
     logging: *logging
     hostname: cp3
     restart: unless-stopped
+    # Same two settings as node 1 (compose.prod.yml `controlplane`, where the
+    # reasons are). They are restated because cp2/cp3 are whole services, not
+    # overrides: a setting added only to node 1 never reaches them.
+    stop_grace_period: 30s
+    mem_limit: ${SENTINEL_CP_MEM_LIMIT:-512m}
     user: "0:0"
     depends_on:
       postgres: { condition: service_healthy }
