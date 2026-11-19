@@ -12,7 +12,8 @@
 //!   - `host_kv_get(key_ptr, key_len, out_ptr, out_max_len) -> i32`
 //!     — read from the shared plugin KV store.
 //!   - `host_kv_set(key_ptr, key_len, val_ptr, val_len)` — write to the
-//!     shared plugin KV store.
+//!     shared plugin KV store. The store is bounded (`MAX_KV_*`): a write
+//!     past a bound is dropped.
 //!   - `host_http_callout(ptr, len) -> i32` — queue an outbound HTTP request;
 //!     returns a request id (≥0) or -1 on error.
 //!   - `host_http_callout_status(id) -> i32` — read response status code
@@ -290,7 +291,76 @@ fn host_kv_set(
     };
 
     let kv = caller.data().kv_store.clone();
-    kv.insert(key.clone(), value);
+    if let Err(why) = kv_put(&kv, key, value) {
+        // First rejection, then every 10,000th: a plugin writing a key per
+        // request would otherwise log a line per request.
+        let n = KV_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 10_000 == 0 {
+            tracing::warn!(
+                plugin = %caller.data().plugin_name,
+                reason = why.as_str(),
+                rejected_total = n + 1,
+                "plugin KV write dropped: the store is bounded"
+            );
+        }
+    }
+}
+
+/// Longest key the plugin KV store accepts, in bytes.
+pub const MAX_KV_KEY_BYTES: usize = 256;
+/// Longest value the plugin KV store accepts, in bytes.
+pub const MAX_KV_VALUE_BYTES: usize = 4096;
+/// Most keys the plugin KV store holds. With the two limits above the store's
+/// worst case is about 43 MiB.
+pub const MAX_KV_ENTRIES: usize = 10_000;
+
+/// KV writes dropped by [`kv_put`] since the process started.
+static KV_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why [`kv_put`] refused a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvReject {
+    KeyTooLong,
+    ValueTooLong,
+    StoreFull,
+}
+
+impl KvReject {
+    fn as_str(self) -> &'static str {
+        match self {
+            KvReject::KeyTooLong => "key_too_long",
+            KvReject::ValueTooLong => "value_too_long",
+            KvReject::StoreFull => "store_full",
+        }
+    }
+}
+
+/// Write to the plugin KV store, within its bounds.
+///
+/// The store is HOST memory: the per-plugin linear-memory limit does not count
+/// it, and nothing ever removed an entry. A plugin keeping one key per client —
+/// the counter every rate-limiting plugin keeps — grew the data plane's heap
+/// for as long as the process lived. A write that would exceed a bound is
+/// dropped; overwriting a key that already exists is always allowed, so a
+/// plugin at the limit keeps updating the counters it has.
+pub(crate) fn kv_put(
+    kv: &DashMap<String, String>,
+    key: String,
+    value: String,
+) -> Result<(), KvReject> {
+    if key.len() > MAX_KV_KEY_BYTES {
+        return Err(KvReject::KeyTooLong);
+    }
+    if value.len() > MAX_KV_VALUE_BYTES {
+        return Err(KvReject::ValueTooLong);
+    }
+    // Racing writers can overshoot by at most one entry per thread; the bound
+    // is on growth, not an exact count.
+    if kv.len() >= MAX_KV_ENTRIES && !kv.contains_key(&key) {
+        return Err(KvReject::StoreFull);
+    }
+    kv.insert(key, value);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +572,54 @@ mod tests {
         assert_eq!(kv.get("rate_limit_key").unwrap().value().as_str(), "99");
 
         assert!(kv.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn kv_put_refuses_new_keys_once_the_store_is_full() {
+        let kv: DashMap<String, String> = DashMap::new();
+        for i in 0..MAX_KV_ENTRIES {
+            assert_eq!(kv_put(&kv, format!("ip:{i}"), "1".into()), Ok(()));
+        }
+        // One key per client is how the store used to grow without end.
+        assert_eq!(
+            kv_put(&kv, "ip:one-more".into(), "1".into()),
+            Err(KvReject::StoreFull)
+        );
+        assert_eq!(kv.len(), MAX_KV_ENTRIES);
+        assert!(kv.get("ip:one-more").is_none());
+    }
+
+    #[test]
+    fn kv_put_still_updates_existing_keys_when_full() {
+        let kv: DashMap<String, String> = DashMap::new();
+        for i in 0..MAX_KV_ENTRIES {
+            kv_put(&kv, format!("ip:{i}"), "1".into()).unwrap();
+        }
+        assert_eq!(kv_put(&kv, "ip:7".into(), "2".into()), Ok(()));
+        assert_eq!(kv.get("ip:7").unwrap().value().as_str(), "2");
+    }
+
+    #[test]
+    fn kv_put_refuses_oversized_keys_and_values() {
+        let kv: DashMap<String, String> = DashMap::new();
+        assert_eq!(
+            kv_put(&kv, "k".repeat(MAX_KV_KEY_BYTES + 1), "v".into()),
+            Err(KvReject::KeyTooLong)
+        );
+        assert_eq!(
+            kv_put(&kv, "k".into(), "v".repeat(MAX_KV_VALUE_BYTES + 1)),
+            Err(KvReject::ValueTooLong)
+        );
+        assert!(kv.is_empty());
+        // At the limit is fine.
+        assert_eq!(
+            kv_put(
+                &kv,
+                "k".repeat(MAX_KV_KEY_BYTES),
+                "v".repeat(MAX_KV_VALUE_BYTES)
+            ),
+            Ok(())
+        );
     }
 }
 
