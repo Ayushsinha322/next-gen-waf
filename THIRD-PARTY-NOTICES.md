@@ -210,33 +210,33 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - zmij 1.0.21
 
 ### Apache-2.0 WITH LLVM-exception — 27 component(s)
-- cranelift-assembler-x64 0.123.20
-- cranelift-bforest 0.123.20
-- cranelift-bitset 0.123.20
-- cranelift-codegen 0.123.20
-- cranelift-codegen-shared 0.123.20
-- cranelift-control 0.123.20
-- cranelift-entity 0.123.20
-- cranelift-frontend 0.123.20
-- cranelift-native 0.123.20
-- pulley-interpreter 36.0.20
-- pulley-macros 36.0.20
+- cranelift-assembler-x64 0.123.21
+- cranelift-bforest 0.123.21
+- cranelift-bitset 0.123.21
+- cranelift-codegen 0.123.21
+- cranelift-codegen-shared 0.123.21
+- cranelift-control 0.123.21
+- cranelift-entity 0.123.21
+- cranelift-frontend 0.123.21
+- cranelift-native 0.123.21
+- pulley-interpreter 36.0.21
+- pulley-macros 36.0.21
 - regalloc2 0.12.2
 - target-lexicon 0.13.5
-- wasmtime 36.0.20
-- wasmtime-environ 36.0.20
-- wasmtime-internal-asm-macros 36.0.20
-- wasmtime-internal-component-macro 36.0.20
-- wasmtime-internal-component-util 36.0.20
-- wasmtime-internal-cranelift 36.0.20
-- wasmtime-internal-fiber 36.0.20
-- wasmtime-internal-jit-debug 36.0.20
-- wasmtime-internal-jit-icache-coherence 36.0.20
-- wasmtime-internal-math 36.0.20
-- wasmtime-internal-slab 36.0.20
-- wasmtime-internal-unwinder 36.0.20
-- wasmtime-internal-versioned-export-macros 36.0.20
-- wasmtime-internal-wit-bindgen 36.0.20
+- wasmtime 36.0.21
+- wasmtime-environ 36.0.21
+- wasmtime-internal-asm-macros 36.0.21
+- wasmtime-internal-component-macro 36.0.21
+- wasmtime-internal-component-util 36.0.21
+- wasmtime-internal-cranelift 36.0.21
+- wasmtime-internal-fiber 36.0.21
+- wasmtime-internal-jit-debug 36.0.21
+- wasmtime-internal-jit-icache-coherence 36.0.21
+- wasmtime-internal-math 36.0.21
+- wasmtime-internal-slab 36.0.21
+- wasmtime-internal-unwinder 36.0.21
+- wasmtime-internal-versioned-export-macros 36.0.21
+- wasmtime-internal-wit-bindgen 36.0.21
 
 ### Unicode-3.0 — 18 component(s)
 - icu_collections 2.4.0
@@ -679,12 +679,12 @@ Present in this working tree, **not redistributed**: test harnesses, build scrip
 - valuable 0.1.1
 
 ### Apache-2.0 WITH LLVM-exception — 6 component(s)
-- cranelift-assembler-x64-meta 0.123.20
-- cranelift-codegen-meta 0.123.20
-- cranelift-isle 0.123.20
-- cranelift-srcgen 0.123.20
-- wasmtime-internal-winch 36.0.20
-- winch-codegen 36.0.20
+- cranelift-assembler-x64-meta 0.123.21
+- cranelift-codegen-meta 0.123.21
+- cranelift-isle 0.123.21
+- cranelift-srcgen 0.123.21
+- wasmtime-internal-winch 36.0.21
+- winch-codegen 36.0.21
 
 ### MIT/Apache-2.0 — 5 component(s)
 - android_system_properties 0.1.5
