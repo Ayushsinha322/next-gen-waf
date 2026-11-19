@@ -2012,6 +2012,136 @@ async fn a_dead_upstream_yields_a_logged_502_not_a_dropped_connection() {
     shutdown_proxy(tx, jh).await;
 }
 
+/// An origin that accepts connections and never answers until `answer` is set,
+/// then answers 200. Each request's response is decided when it arrives.
+async fn start_switchable_origin(
+    answer: Arc<std::sync::atomic::AtomicBool>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let answer = Arc::clone(&answer);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = hyper::service::service_fn(move |_req: Request<Incoming>| {
+                    let answer = Arc::clone(&answer);
+                    async move {
+                        while !answer.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Ok::<_, std::convert::Infallible>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body("origin-back".to_string())
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// A hung origin trips the circuit, after which requests are answered 503 at
+/// once — with a Retry-After — instead of each waiting out the timeout; and the
+/// site comes back by itself through one probe once the origin answers again.
+///
+/// Before 1.1.27 the breaker force-reset itself whenever every origin was open,
+/// so for a one-origin site it never shed: request after request waited the full
+/// timeout, holding a node-wide in-flight permit, and logged a warning.
+#[tokio::test]
+async fn a_hung_origin_trips_the_circuit_then_fails_fast_then_recovers() {
+    let answer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (origin, _h) = start_switchable_origin(Arc::clone(&answer)).await;
+    let port = next_port();
+    let mut cfg = test_config(
+        port,
+        origin.port(),
+        "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+        WafMode::Blocking,
+    );
+    cfg.sites[0].upstream.timeout_secs = Some(1);
+    let (tx, jh) = start_proxy(cfg).await;
+
+    // Five timeouts trip it. Each is a real 504 after ~1 s.
+    for i in 0..5 {
+        let (status, _) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "request {i}");
+    }
+
+    // Now: refused at once, 503, with a Retry-After the client can honour.
+    let t = std::time::Instant::now();
+    let (status, retry_after) = {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let resp = sender
+            .send_request(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "test-site.local")
+                    .header(
+                        header::USER_AGENT,
+                        "Mozilla/5.0 (X11; Linux x86_64) Chrome/125.0",
+                    )
+                    .body(http_body_util::Full::new(bytes::Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ra = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        (resp.status(), ra)
+    };
+    let took = t.elapsed();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "an open circuit must answer at once, took {took:?} (the timeout is 1 s)"
+    );
+    let retry_after = retry_after.expect("503 without Retry-After");
+    assert!((1..=5).contains(&retry_after), "Retry-After {retry_after}");
+
+    // The origin comes back. After the open window one request probes it and
+    // closes the circuit; the site serves again with no operator involved.
+    answer.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+    let mut recovered = false;
+    for _ in 0..20 {
+        let (status, body) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+        if status == StatusCode::OK {
+            assert_eq!(body, b"origin-back");
+            recovered = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        recovered,
+        "the circuit never closed after the origin came back"
+    );
+    let (status, _) = send_request(port, "test-site.local", "/", Method::GET, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "closed for good, not one lucky probe"
+    );
+    shutdown_proxy(tx, jh).await;
+}
+
 /// A request whose Host matches no site gets a real answer, never silence — and
 /// that answer is 404 "no site for this hostname", not 502. It used to fail as
 /// an upstream error, and a 502 tells whoever is debugging a new DNS record that

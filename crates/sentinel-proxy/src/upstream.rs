@@ -16,10 +16,20 @@
 //!
 //! ## Health checks + circuit breaker
 //! Each server tracks consecutive failures.  After
-//! [`CIRCUIT_OPEN_THRESHOLD`] consecutive failures the circuit is opened and the
-//! server is excluded from selection for [`CIRCUIT_HALF_OPEN_SECS`] seconds.
-//! After that window the circuit transitions to half-open: the next request is
-//! allowed through; a success closes the circuit, a failure re-opens it.
+//! [`CIRCUIT_OPEN_THRESHOLD`] consecutive failures the circuit OPENS and the
+//! server is not sent requests for [`CIRCUIT_OPEN_BASE_MS`]. Then it is
+//! HALF-OPEN: exactly one request goes through as a probe. Success closes the
+//! circuit; failure re-opens it for twice as long, up to [`CIRCUIT_OPEN_MAX_MS`].
+//!
+//! When every server of a site is open, the request is answered 503 with a
+//! Retry-After at once ([`OriginUnavailable`]) — the origin is known to be down,
+//! so the visitor is not made to wait out a connect timeout to learn it.
+//!
+//! ## Per-site bulkhead
+//! Each site may have at most [`site_inflight_limit`] requests waiting on its
+//! origin at once; past that it is shed with 503 ([`SiteBusy`]). The node-wide
+//! in-flight limit is shared by every site, so without this one site with a hung
+//! origin held every permit it could get and the node shed ALL sites.
 //!
 //! Active health checks can be enabled via the `health_check` block in the
 //! upstream config:
@@ -35,9 +45,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -49,7 +59,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use sentinel_core::config::{LoadBalancerStrategy, SentinelConfig, UpstreamServer};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -59,8 +69,16 @@ use tracing::{debug, error, info, warn};
 /// Number of consecutive upstream failures before a server's circuit opens.
 const CIRCUIT_OPEN_THRESHOLD: usize = 5;
 
-/// Seconds an open circuit waits before allowing a single half-open probe.
-const CIRCUIT_HALF_OPEN_SECS: u64 = 30;
+/// How long a circuit stays open before one probe is let through.
+///
+/// Short on purpose. While every origin of a site is open the site answers 503,
+/// so this is also how long a site stays down after its origin comes back from
+/// a restart. A probe that fails doubles the wait, up to the ceiling below, so
+/// an origin that stays down costs one request per 30 s, not one per 5 s.
+const CIRCUIT_OPEN_BASE_MS: u64 = 5_000;
+
+/// Longest a circuit stays open between probes.
+const CIRCUIT_OPEN_MAX_MS: u64 = 30_000;
 
 /// Default upstream connect timeout (bounds TCP + TLS establishment). Override
 /// with `SENTINEL_UPSTREAM_CONNECT_TIMEOUT_SECS`.
@@ -100,11 +118,30 @@ fn env_secs(key: &str, default: u64) -> u64 {
 // Per-server health + circuit-breaker state
 // ---------------------------------------------------------------------------
 
+/// Milliseconds on a monotonic clock local to this process. Wall-clock time
+/// would let an NTP step open or close every circuit at once.
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Where a server's circuit stands at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Circuit {
+    Closed,
+    /// No request may be sent for `retry_in_ms` more milliseconds.
+    Open {
+        retry_in_ms: u64,
+    },
+    /// One probe may be sent, if no other probe is already out.
+    HalfOpen,
+}
+
 /// All runtime tracking for a single upstream server.
 struct ServerHealth {
     server: UpstreamServer,
 
-    /// `true` = server considers itself healthy (gates selection).
+    /// `true` = server considers itself healthy. Reporting only (`stats`).
     healthy: AtomicBool,
 
     /// Number of requests currently being sent to this server (LeastConn).
@@ -113,8 +150,16 @@ struct ServerHealth {
     /// How many upstream errors have occurred in a row.
     consecutive_failures: AtomicUsize,
 
-    /// UNIX timestamp (seconds) when the circuit was last opened.
-    circuit_opened_at: AtomicUsize,
+    /// `now_ms()` when the circuit last opened.
+    opened_at_ms: AtomicU64,
+
+    /// How long the circuit stays open this time; doubles per failed probe.
+    open_for_ms: AtomicU64,
+
+    /// A half-open probe is out. Cleared by the probe's [`Lease`] however the
+    /// request ends — including the client going away mid-request, which used
+    /// to be the way a breaker got stuck.
+    probe_in_flight: AtomicBool,
 }
 
 impl ServerHealth {
@@ -124,44 +169,206 @@ impl ServerHealth {
             healthy: AtomicBool::new(true),
             active_conns: AtomicUsize::new(0),
             consecutive_failures: AtomicUsize::new(0),
-            circuit_opened_at: AtomicUsize::new(0),
+            opened_at_ms: AtomicU64::new(0),
+            open_for_ms: AtomicU64::new(CIRCUIT_OPEN_BASE_MS),
+            probe_in_flight: AtomicBool::new(false),
         }
     }
 
-    /// Return `true` if this server may receive traffic right now.
-    fn is_available(&self) -> bool {
-        let failures = self.consecutive_failures.load(Ordering::Relaxed);
-        if failures < CIRCUIT_OPEN_THRESHOLD {
-            return true;
+    fn circuit_at(&self, now: u64) -> Circuit {
+        if self.consecutive_failures.load(Ordering::Acquire) < CIRCUIT_OPEN_THRESHOLD {
+            return Circuit::Closed;
         }
-        // Circuit open — check half-open window.
-        let opened_at = self.circuit_opened_at.load(Ordering::Relaxed) as u64;
-        let now = unix_now_secs();
-        if now >= opened_at + CIRCUIT_HALF_OPEN_SECS {
-            // Reset failures so the next request is a half-open probe.
-            self.consecutive_failures.store(0, Ordering::Relaxed);
-            return true;
+        let until =
+            self.opened_at_ms.load(Ordering::Acquire) + self.open_for_ms.load(Ordering::Acquire);
+        if now < until {
+            Circuit::Open {
+                retry_in_ms: until - now,
+            }
+        } else {
+            Circuit::HalfOpen
         }
-        false
+    }
+
+    /// Claim the one half-open probe. False if another request holds it.
+    fn try_claim_probe(&self) -> bool {
+        self.probe_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.healthy.store(true, Ordering::Relaxed);
+        let failures = self.consecutive_failures.swap(0, Ordering::AcqRel);
+        self.open_for_ms
+            .store(CIRCUIT_OPEN_BASE_MS, Ordering::Release);
+        let was_down = !self.healthy.swap(true, Ordering::AcqRel);
+        if was_down || failures >= CIRCUIT_OPEN_THRESHOLD {
+            info!(
+                host = %self.server.host,
+                port = self.server.port,
+                "upstream circuit closed: origin answering again"
+            );
+        }
     }
 
-    fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= CIRCUIT_OPEN_THRESHOLD {
-            self.healthy.store(false, Ordering::Relaxed);
-            self.circuit_opened_at
-                .store(unix_now_secs() as usize, Ordering::Relaxed);
+    /// `probe`: this failure is the outcome of the half-open probe.
+    fn record_failure_at(&self, probe: bool, now: u64) {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if probe {
+            // The origin is still down: wait twice as long before the next try.
+            let next = (self.open_for_ms.load(Ordering::Acquire) * 2).min(CIRCUIT_OPEN_MAX_MS);
+            self.open_for_ms.store(next, Ordering::Release);
+            self.opened_at_ms.store(now, Ordering::Release);
+            self.healthy.store(false, Ordering::Release);
+            debug!(
+                host = %self.server.host,
+                port = self.server.port,
+                next_probe_in_ms = next,
+                "upstream circuit probe failed; staying open"
+            );
+        } else if failures == CIRCUIT_OPEN_THRESHOLD {
+            self.open_for_ms
+                .store(CIRCUIT_OPEN_BASE_MS, Ordering::Release);
+            self.opened_at_ms.store(now, Ordering::Release);
+            self.healthy.store(false, Ordering::Release);
             warn!(
                 host = %self.server.host,
                 port = self.server.port,
                 failures,
-                "upstream circuit breaker opened"
+                "upstream circuit breaker opened: requests answered 503 until a probe succeeds"
             );
+        }
+        // Past the threshold and not a probe: a request sent before the circuit
+        // opened, finishing late. The window is already running; leave it.
+    }
+
+    fn record_failure(&self, probe: bool) {
+        self.record_failure_at(probe, now_ms())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast-fail errors — typed, so the gateway maps them to 503 without parsing
+// ---------------------------------------------------------------------------
+
+/// Every origin of the site has an open circuit. Answered 503 at once.
+#[derive(Debug, Clone, Copy)]
+pub struct OriginUnavailable {
+    /// When a probe will next be let through — the Retry-After.
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for OriginUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "origin unavailable: every upstream server's circuit is open (next probe in {} ms)",
+            self.retry_after.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for OriginUnavailable {}
+
+/// The site already has its limit of requests waiting on its origin.
+#[derive(Debug, Clone, Copy)]
+pub struct SiteBusy {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for SiteBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "site at its in-flight limit ({} requests waiting on the origin)",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for SiteBusy {}
+
+/// The right to send one request to one server: which server, whether the
+/// request is that server's half-open probe, and the site's in-flight permit.
+///
+/// Everything it accounts for is undone when it drops, however the request
+/// ends: the permit returns, the active-connection count comes down, and a
+/// probe that produced no outcome — the client went away mid-request — frees
+/// the probe for the next request. Before this, a request future dropped
+/// mid-send never decremented `active_conns`, skewing LeastConn for good.
+pub struct Lease {
+    health: Arc<ServerHealth>,
+    probe: bool,
+    settled: bool,
+    timeout: Duration,
+    connect_timeout: Option<Duration>,
+    _site_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Lease {
+    fn new(
+        health: Arc<ServerHealth>,
+        probe: bool,
+        timeout: Duration,
+        connect_timeout: Option<Duration>,
+        site_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        health.active_conns.fetch_add(1, Ordering::AcqRel);
+        Self {
+            health,
+            probe,
+            settled: false,
+            timeout,
+            connect_timeout,
+            _site_permit: site_permit,
+        }
+    }
+
+    /// The server this lease is for.
+    pub fn server(&self) -> &UpstreamServer {
+        &self.health.server
+    }
+
+    /// Whether this request is the server's half-open probe.
+    pub fn is_probe(&self) -> bool {
+        self.probe
+    }
+
+    fn settle(&mut self, ok: bool) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if ok {
+            self.health.record_success();
+        } else {
+            self.health.record_failure(self.probe);
+        }
+        if self.probe {
+            self.health.probe_in_flight.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field(
+                "server",
+                &format_args!("{}:{}", self.health.server.host, self.health.server.port),
+            )
+            .field("probe", &self.probe)
+            .field("settled", &self.settled)
+            .finish()
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.health.active_conns.fetch_sub(1, Ordering::AcqRel);
+        if self.probe && !self.settled {
+            // No outcome — not evidence either way. Free the probe.
+            self.health.probe_in_flight.store(false, Ordering::Release);
         }
     }
 }
@@ -180,6 +387,11 @@ pub(crate) struct SiteUpstream {
     /// Per-site override for the CONNECT timeout, already clamped.  `None` = use
     /// the deployment-wide connector.  See [`UpstreamConfig::connect_timeout_secs`].
     connect_timeout: Option<Duration>,
+    /// The site's bulkhead: one permit per request waiting on its origin.
+    /// Carried across config syncs, so a sync does not hand a busy site a
+    /// fresh, empty allowance.
+    inflight: Arc<Semaphore>,
+    inflight_limit: usize,
 }
 
 /// Clamp a per-site connect timeout into something defensible.
@@ -200,12 +412,26 @@ fn site_timeout(secs: Option<u64>) -> Option<Duration> {
     secs.filter(|&s| s > 0).map(Duration::from_secs)
 }
 
+/// What [`SiteUpstream::choose`] decided, before any permit is taken.
+enum Choice {
+    /// Send to this server; `probe` if it is that server's half-open probe.
+    Server {
+        health: Arc<ServerHealth>,
+        probe: bool,
+    },
+    /// Every server is open (or half-open with its probe already out).
+    AllOpen { retry_after: Duration },
+    /// The site has no servers configured.
+    NoServers,
+}
+
 impl SiteUpstream {
     fn new(
         servers: Vec<UpstreamServer>,
         strategy: LoadBalancerStrategy,
         timeout: Option<Duration>,
         connect_timeout: Option<Duration>,
+        inflight_limit: usize,
     ) -> Self {
         Self {
             servers: servers
@@ -216,45 +442,70 @@ impl SiteUpstream {
             strategy,
             timeout,
             connect_timeout,
+            inflight: Arc::new(Semaphore::new(inflight_limit)),
+            inflight_limit,
         }
     }
 
-    /// Select a server according to the configured strategy.
+    /// Pick a server at `now`.
     ///
-    /// Only considers servers where `is_available()` returns `true`.  If all
-    /// servers have open circuits, force-resets them all and falls back to the
-    /// first server so traffic is never silently dropped.
-    fn select(&self, client_ip: Option<IpAddr>) -> Option<Arc<ServerHealth>> {
-        let available: Vec<Arc<ServerHealth>> = self
-            .servers
-            .iter()
-            .filter(|s| s.is_available())
-            .cloned()
-            .collect();
-
-        let pool = if available.is_empty() {
-            if self.servers.is_empty() {
-                return None;
+    /// A half-open server with no probe out gets this request as its probe —
+    /// even when other servers are closed, or a recovered server would never be
+    /// tried again. Otherwise the strategy picks among the closed ones. With
+    /// none closed, the answer is [`Choice::AllOpen`]: the request fails fast.
+    ///
+    /// This used to force-reset every circuit when all were open and send the
+    /// request anyway, "so traffic is never silently dropped". For the usual
+    /// single-origin site that meant the breaker never shed a thing: each
+    /// request to a dead origin waited out the connect timeout, holding a
+    /// node-wide in-flight permit, and logged a warning — every request.
+    fn choose(&self, client_ip: Option<IpAddr>, now: u64) -> Choice {
+        if self.servers.is_empty() {
+            return Choice::NoServers;
+        }
+        let mut closed: Vec<Arc<ServerHealth>> = Vec::with_capacity(self.servers.len());
+        let mut soonest_ms: Option<u64> = None;
+        for s in &self.servers {
+            match s.circuit_at(now) {
+                Circuit::Closed => closed.push(Arc::clone(s)),
+                Circuit::HalfOpen => {
+                    if s.try_claim_probe() {
+                        return Choice::Server {
+                            health: Arc::clone(s),
+                            probe: true,
+                        };
+                    }
+                    // Probe already out: its answer is due within a timeout.
+                    soonest_ms = Some(soonest_ms.map_or(1_000, |m| m.min(1_000)));
+                }
+                Circuit::Open { retry_in_ms } => {
+                    soonest_ms = Some(soonest_ms.map_or(retry_in_ms, |m| m.min(retry_in_ms)));
+                }
             }
-            warn!("all upstream servers have open circuits; forcing reset");
-            for s in &self.servers {
-                s.consecutive_failures.store(0, Ordering::Relaxed);
-                s.healthy.store(true, Ordering::Relaxed);
-            }
-            self.servers.clone()
-        } else {
-            available
-        };
+        }
+        if closed.is_empty() {
+            return Choice::AllOpen {
+                retry_after: Duration::from_millis(soonest_ms.unwrap_or(CIRCUIT_OPEN_BASE_MS)),
+            };
+        }
+        Choice::Server {
+            health: self.pick(&closed, client_ip),
+            probe: false,
+        }
+    }
 
+    /// Apply the load-balancing strategy to a non-empty candidate list.
+    fn pick(&self, pool: &[Arc<ServerHealth>], client_ip: Option<IpAddr>) -> Arc<ServerHealth> {
         match self.strategy {
             LoadBalancerStrategy::RoundRobin | LoadBalancerStrategy::Adaptive => {
                 let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % pool.len();
-                Some(Arc::clone(&pool[idx]))
+                Arc::clone(&pool[idx])
             }
             LoadBalancerStrategy::LeastConn => pool
                 .iter()
                 .min_by_key(|s| s.active_conns.load(Ordering::Relaxed))
-                .cloned(),
+                .cloned()
+                .unwrap_or_else(|| Arc::clone(&pool[0])),
             LoadBalancerStrategy::IpHash => {
                 let hash = if let Some(ip) = client_ip {
                     let mut h = DefaultHasher::new();
@@ -263,17 +514,28 @@ impl SiteUpstream {
                 } else {
                     self.cursor.fetch_add(1, Ordering::Relaxed)
                 };
-                Some(Arc::clone(&pool[hash % pool.len()]))
+                Arc::clone(&pool[hash % pool.len()])
             }
             LoadBalancerStrategy::Random => {
                 let seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .subsec_nanos() as usize;
-                Some(Arc::clone(&pool[seed % pool.len()]))
+                Arc::clone(&pool[seed % pool.len()])
             }
         }
     }
+}
+
+/// Default per-site in-flight limit: half the node's in-flight limit, so one
+/// site with a hung origin can hold at most half the node and every other site
+/// keeps the rest. `SENTINEL_SITE_MAX_INFLIGHT_REQUESTS` overrides it.
+fn site_inflight_limit(node_limit: usize) -> usize {
+    std::env::var("SENTINEL_SITE_MAX_INFLIGHT_REQUESTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (node_limit / 2).max(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +817,8 @@ pub struct UpstreamPool {
     sni_overrides: Arc<SniRegistry>,
     /// Overall per-request upstream timeout (see [`UPSTREAM_TIMEOUT_SECS`]).
     upstream_timeout: Duration,
+    /// Each site's bulkhead size (see [`site_inflight_limit`]).
+    site_inflight_limit: usize,
 }
 
 impl UpstreamPool {
@@ -695,12 +959,23 @@ impl UpstreamPool {
         let sni_overrides: Arc<SniRegistry> = Arc::new(DashMap::new());
         Self::refresh_sni_overrides(&sni_overrides, &cfg.sites);
 
+        // The node limit as the proxy resolves it (env over config), so the
+        // default share is half of what is really enforced.
+        let node_inflight = std::env::var("SENTINEL_MAX_INFLIGHT_REQUESTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(cfg.limits.max_inflight_requests)
+            .max(1);
+        let site_inflight_limit = site_inflight_limit(node_inflight);
+
         let pool = Self {
             sites: DashMap::new(),
             client: build_client(connect_timeout, Arc::clone(&sni_overrides)),
             connect_timeout_clients: DashMap::new(),
             sni_overrides,
             upstream_timeout,
+            site_inflight_limit,
         };
 
         for site in &cfg.sites {
@@ -711,6 +986,7 @@ impl UpstreamPool {
                     site.upstream.load_balancer.clone(),
                     site_timeout(site.upstream.timeout_secs),
                     site_connect_timeout(site.upstream.connect_timeout_secs),
+                    site_inflight_limit,
                 )),
             );
         }
@@ -721,22 +997,57 @@ impl UpstreamPool {
     // Server selection
     // -----------------------------------------------------------------------
 
-    /// Select the next server for `site_id` using round-robin.
-    pub fn next_server(&self, site_id: &str) -> Option<UpstreamServer> {
-        self.select_server(site_id, None)
+    /// Take the right to send one request for `site_id`: a server, chosen by
+    /// the site's strategy and circuit state, and a place in the site's
+    /// bulkhead.
+    ///
+    /// Fails fast, and typed: [`OriginUnavailable`] when every origin's circuit
+    /// is open, [`SiteBusy`] when the site already has its limit of requests
+    /// waiting on the origin. The gateway answers both 503 with a Retry-After.
+    pub fn lease(&self, site_id: &str, client_ip: Option<IpAddr>) -> anyhow::Result<Lease> {
+        let site = self
+            .sites
+            .get(site_id)
+            .map(|s| Arc::clone(s.value()))
+            .ok_or_else(|| anyhow::anyhow!("no upstream configured for site '{site_id}'"))?;
+        let (health, probe) = match site.choose(client_ip, now_ms()) {
+            Choice::Server { health, probe } => (health, probe),
+            Choice::AllOpen { retry_after } => {
+                return Err(anyhow::Error::new(OriginUnavailable { retry_after }));
+            }
+            Choice::NoServers => {
+                return Err(anyhow::anyhow!(
+                    "no upstream servers configured for site '{site_id}'"
+                ));
+            }
+        };
+        let permit = match Arc::clone(&site.inflight).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                if probe {
+                    // Never sent: give the probe back for the next request.
+                    health.probe_in_flight.store(false, Ordering::Release);
+                }
+                return Err(anyhow::Error::new(SiteBusy {
+                    limit: site.inflight_limit,
+                }));
+            }
+        };
+        Ok(Lease::new(
+            health,
+            probe,
+            site.timeout.unwrap_or(self.upstream_timeout),
+            site.connect_timeout,
+            Some(permit),
+        ))
     }
 
-    /// Select a server using the configured LB strategy and an optional client
-    /// IP (used for IpHash session affinity).
-    pub fn select_server(
-        &self,
-        site_id: &str,
-        client_ip: Option<IpAddr>,
-    ) -> Option<UpstreamServer> {
+    /// Requests of `site_id` currently waiting on its origin. Tests and
+    /// diagnostics.
+    pub fn site_inflight(&self, site_id: &str) -> Option<usize> {
         self.sites
-            .get(site_id)?
-            .select(client_ip)
-            .map(|h| h.server.clone())
+            .get(site_id)
+            .map(|s| s.inflight_limit - s.inflight.available_permits())
     }
 
     // -----------------------------------------------------------------------
@@ -759,56 +1070,31 @@ impl UpstreamPool {
             .map_err(|e| anyhow::anyhow!("management upstream request failed: {e}"))
     }
 
-    /// Send a pre-built upstream request and return the response.
+    /// Send a pre-built upstream request under `lease` and return the response.
     ///
-    /// The request URI must already point at the upstream server.  Connection
-    /// pooling is handled by the pooled client; the correct pool entry is
-    /// selected by the `Host` / authority in the URI.
-    ///
-    /// Per-server circuit-breaker state is updated: success resets the failure
-    /// counter, failure increments it and may open the circuit.
-    pub async fn send_request(
+    /// The request URI must already point at the lease's server. The outcome is
+    /// recorded on that server's circuit: any response — whatever its status —
+    /// is a success; a connect, TLS or transport error, or no response headers
+    /// within the site's timeout, is a failure.
+    pub async fn send(
         &self,
-        site_id: &str,
-        server_host: &str,
-        server_port: u16,
+        lease: &mut Lease,
         req: Request<BoxBody<Bytes, hyper::Error>>,
     ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
-        // Locate the ServerHealth for this specific server so we can track
-        // active connections and circuit-breaker state, and pick up the site's
-        // timeout override in the same lookup.
-        let (srv_health, timeout, connect_timeout): (
-            Option<Arc<ServerHealth>>,
-            Duration,
-            Option<Duration>,
-        ) = match self.sites.get(site_id) {
-            Some(site) => (
-                site.servers
-                    .iter()
-                    .find(|h| h.server.host == server_host && h.server.port == server_port)
-                    .cloned(),
-                site.timeout.unwrap_or(self.upstream_timeout),
-                site.connect_timeout,
-            ),
-            None => (None, self.upstream_timeout, None),
-        };
-
         // Pick the connection pool. Almost every site uses the shared default; a
         // site with its own connect timeout gets the pool built for that value.
         // Cloning is cheap and shares the pool — hyper's Client is Arc-backed —
         // and avoids holding a DashMap guard across the await below, which would
         // block any concurrent insert for the whole upstream round-trip.
-        let client = match connect_timeout {
+        let client = match lease.connect_timeout {
             None => self.client.clone(),
             Some(ct) => self.client_for_connect_timeout(ct),
         };
-
-        if let Some(ref h) = srv_health {
-            h.active_conns.fetch_add(1, Ordering::Relaxed);
-        }
+        let timeout = lease.timeout;
 
         debug!(
-            upstream = ?format!("{}:{}", server_host, server_port),
+            upstream = ?format!("{}:{}", lease.server().host, lease.server().port),
+            probe = lease.probe,
             "forwarding to upstream (pooled)"
         );
 
@@ -823,16 +1109,43 @@ impl UpstreamPool {
             // without parsing an error message. See `UpstreamTimeout`.
             Err(_) => Err(anyhow::Error::new(UpstreamTimeout(timeout))),
         };
-
-        if let Some(ref h) = srv_health {
-            h.active_conns.fetch_sub(1, Ordering::Relaxed);
-            match &result {
-                Ok(_) => h.record_success(),
-                Err(_) => h.record_failure(),
-            }
-        }
-
+        lease.settle(result.is_ok());
         result
+    }
+
+    /// Send to a NAMED server of `site_id`, outside the circuit breaker's
+    /// admission (no fast-fail, no bulkhead) but recording the outcome on its
+    /// circuit. For callers that already know where the request goes.
+    pub async fn send_request(
+        &self,
+        site_id: &str,
+        server_host: &str,
+        server_port: u16,
+        req: Request<BoxBody<Bytes, hyper::Error>>,
+    ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
+        let site = self.sites.get(site_id).map(|s| Arc::clone(s.value()));
+        let health = site
+            .as_ref()
+            .and_then(|s| {
+                s.servers
+                    .iter()
+                    .find(|h| h.server.host == server_host && h.server.port == server_port)
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{server_host}:{server_port} is not an upstream of site '{site_id}'"
+                )
+            })?;
+        let (timeout, connect_timeout) = match &site {
+            Some(s) => (
+                s.timeout.unwrap_or(self.upstream_timeout),
+                s.connect_timeout,
+            ),
+            None => (self.upstream_timeout, None),
+        };
+        let mut lease = Lease::new(health, false, timeout, connect_timeout, None);
+        self.send(&mut lease, req).await
     }
 
     // -----------------------------------------------------------------------
@@ -881,6 +1194,8 @@ impl UpstreamPool {
                     strategy,
                     timeout,
                     connect_timeout,
+                    inflight: Arc::clone(&existing.inflight),
+                    inflight_limit: existing.inflight_limit,
                 })
             } else {
                 Arc::new(SiteUpstream::new(
@@ -888,6 +1203,7 @@ impl UpstreamPool {
                     strategy,
                     timeout,
                     connect_timeout,
+                    self.site_inflight_limit,
                 ))
             };
 
@@ -975,18 +1291,13 @@ impl UpstreamPool {
                                     Ok(Ok(resp))
                                         if resp.status().as_u16() < 500 =>
                                     {
-                                        let was_down = !srv.healthy.swap(true, Ordering::Relaxed);
-                                        srv.consecutive_failures.store(0, Ordering::Relaxed);
-                                        if was_down {
-                                            info!(
-                                                host = %srv.server.host,
-                                                port = srv.server.port,
-                                                "upstream server recovered"
-                                            );
-                                        }
+                                        // Closes an open circuit at once: the
+                                        // check is a probe that costs no visitor
+                                        // a 503.
+                                        srv.record_success();
                                     }
                                     Ok(Ok(resp)) => {
-                                        srv.record_failure();
+                                        srv.record_failure(false);
                                         debug!(
                                             host = %srv.server.host,
                                             port = srv.server.port,
@@ -995,7 +1306,7 @@ impl UpstreamPool {
                                         );
                                     }
                                     Ok(Err(e)) => {
-                                        srv.record_failure();
+                                        srv.record_failure(false);
                                         debug!(
                                             host = %srv.server.host,
                                             port = srv.server.port,
@@ -1003,7 +1314,7 @@ impl UpstreamPool {
                                         );
                                     }
                                     Err(_elapsed) => {
-                                        srv.record_failure();
+                                        srv.record_failure(false);
                                         debug!(
                                             host = %srv.server.host,
                                             port = srv.server.port,
@@ -1042,13 +1353,6 @@ pub(crate) fn parse_duration_secs(s: &str) -> Option<u64> {
     }
 }
 
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
@@ -1079,12 +1383,14 @@ mod timeout_tests {
             LoadBalancerStrategy::RoundRobin,
             site_timeout(Some(180)),
             None,
+            8,
         );
         let plain = SiteUpstream::new(
             vec![],
             LoadBalancerStrategy::RoundRobin,
             site_timeout(None),
             None,
+            8,
         );
 
         assert_eq!(slow.timeout.unwrap_or(default), Duration::from_secs(180));
@@ -1121,6 +1427,7 @@ mod timeout_tests {
             connect_timeout_clients: DashMap::new(),
             sni_overrides,
             upstream_timeout: Duration::from_secs(30),
+            site_inflight_limit: 8,
         };
 
         let _ = pool.client_for_connect_timeout(Duration::from_secs(3));
@@ -1478,5 +1785,273 @@ mod upstream_ca_tests {
             assert_eq!(upstream_roots().len(), public + 1);
         });
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod circuit_tests {
+    //! The breaker is driven with explicit clock values (`circuit_at`,
+    //! `record_failure_at`, `choose(_, now)`) so nothing here sleeps.
+    use super::*;
+
+    fn srv(port: u16) -> UpstreamServer {
+        UpstreamServer {
+            host: "10.0.0.5".into(),
+            port,
+            weight: 1,
+            tls: false,
+        }
+    }
+
+    fn site(ports: &[u16], limit: usize) -> SiteUpstream {
+        SiteUpstream::new(
+            ports.iter().map(|&p| srv(p)).collect(),
+            LoadBalancerStrategy::RoundRobin,
+            None,
+            None,
+            limit,
+        )
+    }
+
+    fn trip(h: &ServerHealth, now: u64) {
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            h.record_failure_at(false, now);
+        }
+    }
+
+    fn chosen(c: Choice) -> (u16, bool) {
+        match c {
+            Choice::Server { health, probe } => (health.server.port, probe),
+            Choice::AllOpen { retry_after } => panic!("all open, retry {retry_after:?}"),
+            Choice::NoServers => panic!("no servers"),
+        }
+    }
+
+    #[test]
+    fn a_dead_single_origin_fails_fast_instead_of_being_retried() {
+        let s = site(&[8080], 8);
+        let t0 = 1_000_000;
+        trip(&s.servers[0], t0);
+        // The old code force-reset the circuit here and sent the request
+        // anyway — the breaker could never shed for a one-origin site.
+        match s.choose(None, t0 + 1) {
+            Choice::AllOpen { retry_after } => {
+                assert!(retry_after <= Duration::from_millis(CIRCUIT_OPEN_BASE_MS));
+                assert!(retry_after > Duration::ZERO);
+            }
+            _ => panic!("an open circuit on the only origin must fail fast"),
+        }
+        assert_eq!(
+            s.servers[0].consecutive_failures.load(Ordering::Relaxed),
+            CIRCUIT_OPEN_THRESHOLD,
+            "choosing must not reset the evidence"
+        );
+    }
+
+    #[test]
+    fn half_open_admits_exactly_one_probe() {
+        let s = site(&[8080], 8);
+        let t0 = 1_000_000;
+        trip(&s.servers[0], t0);
+        let later = t0 + CIRCUIT_OPEN_BASE_MS;
+        assert_eq!(chosen(s.choose(None, later)), (8080, true));
+        // While the probe is out, everyone else still fails fast.
+        for _ in 0..3 {
+            assert!(matches!(s.choose(None, later), Choice::AllOpen { .. }));
+        }
+    }
+
+    #[test]
+    fn a_successful_probe_closes_the_circuit() {
+        let s = site(&[8080], 8);
+        let t0 = 1_000_000;
+        trip(&s.servers[0], t0);
+        let Choice::Server { health, probe } = s.choose(None, t0 + CIRCUIT_OPEN_BASE_MS) else {
+            panic!("no probe")
+        };
+        let mut lease = Lease::new(health, probe, Duration::from_secs(1), None, None);
+        lease.settle(true);
+        drop(lease);
+        assert_eq!(
+            s.servers[0].circuit_at(t0 + CIRCUIT_OPEN_BASE_MS),
+            Circuit::Closed
+        );
+        assert_eq!(
+            chosen(s.choose(None, t0 + CIRCUIT_OPEN_BASE_MS)),
+            (8080, false)
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_backs_off_to_the_ceiling() {
+        let h = ServerHealth::new(srv(8080));
+        let mut now = 1_000_000;
+        trip(&h, now);
+        let mut waits = vec![];
+        for _ in 0..6 {
+            let Circuit::Open { retry_in_ms } = h.circuit_at(now) else {
+                panic!("not open")
+            };
+            waits.push(retry_in_ms);
+            now += retry_in_ms;
+            assert_eq!(h.circuit_at(now), Circuit::HalfOpen);
+            assert!(h.try_claim_probe());
+            h.record_failure_at(true, now);
+            h.probe_in_flight.store(false, Ordering::Release);
+        }
+        assert_eq!(waits, vec![5_000, 10_000, 20_000, 30_000, 30_000, 30_000]);
+    }
+
+    #[test]
+    fn a_probe_whose_client_left_frees_the_probe() {
+        let s = site(&[8080], 8);
+        let t0 = 1_000_000;
+        trip(&s.servers[0], t0);
+        let later = t0 + CIRCUIT_OPEN_BASE_MS;
+        let Choice::Server { health, probe } = s.choose(None, later) else {
+            panic!("no probe")
+        };
+        let lease = Lease::new(health, probe, Duration::from_secs(1), None, None);
+        // The request future is dropped mid-send: no outcome recorded.
+        drop(lease);
+        // Without the Drop the flag stayed set and the site 503'd for good.
+        assert_eq!(chosen(s.choose(None, later)), (8080, true));
+        assert_eq!(s.servers[0].active_conns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_recovered_server_is_probed_even_while_others_are_healthy() {
+        let s = site(&[8080, 8081], 8);
+        let t0 = 1_000_000;
+        trip(&s.servers[0], t0);
+        // Open: only the healthy one is chosen.
+        for _ in 0..4 {
+            assert_eq!(chosen(s.choose(None, t0 + 1)), (8081, false));
+        }
+        // Half-open: the next request probes it, the rest go to the healthy one.
+        let later = t0 + CIRCUIT_OPEN_BASE_MS;
+        assert_eq!(chosen(s.choose(None, later)), (8080, true));
+        assert_eq!(chosen(s.choose(None, later)), (8081, false));
+    }
+
+    #[test]
+    fn late_failures_from_before_the_trip_do_not_extend_the_backoff() {
+        let h = ServerHealth::new(srv(8080));
+        let t0 = 1_000_000;
+        trip(&h, t0);
+        // Requests sent while the circuit was still closed, failing late.
+        for _ in 0..20 {
+            h.record_failure_at(false, t0 + 4_000);
+        }
+        assert_eq!(h.circuit_at(t0 + CIRCUIT_OPEN_BASE_MS), Circuit::HalfOpen);
+        assert_eq!(h.open_for_ms.load(Ordering::Relaxed), CIRCUIT_OPEN_BASE_MS);
+    }
+
+    #[test]
+    fn success_resets_the_backoff() {
+        let h = ServerHealth::new(srv(8080));
+        let t0 = 1_000_000;
+        trip(&h, t0);
+        h.record_failure_at(true, t0 + 5_000);
+        assert_eq!(h.open_for_ms.load(Ordering::Relaxed), 10_000);
+        h.record_success();
+        assert_eq!(h.open_for_ms.load(Ordering::Relaxed), CIRCUIT_OPEN_BASE_MS);
+        assert_eq!(h.circuit_at(t0 + 6_000), Circuit::Closed);
+    }
+
+    fn site_cfg() -> sentinel_core::config::SiteConfig {
+        use sentinel_core::config::{SiteConfig, UpstreamConfig, WafConfig};
+        SiteConfig {
+            id: "s".into(),
+            tenant_id: String::new(),
+            domains: vec!["s.local".into()],
+            upstream: UpstreamConfig {
+                load_balancer: LoadBalancerStrategy::RoundRobin,
+                servers: vec![srv(8080)],
+                health_check: None,
+                timeout_secs: None,
+                websocket: false,
+                host_header: None,
+                keepalive: true,
+                connect_timeout_secs: None,
+                sni_name: None,
+            },
+            waf: WafConfig::default(),
+            plugins: vec![],
+            tls: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    fn pool_with(limit: usize) -> UpstreamPool {
+        let cfg = SentinelConfig {
+            sites: vec![site_cfg()],
+            ..Default::default()
+        };
+        let mut pool = UpstreamPool::from_config(&cfg);
+        pool.site_inflight_limit = limit;
+        // Rebuild the site with the test's limit.
+        pool.sites.clear();
+        pool.sync_sites(&cfg.sites);
+        pool
+    }
+
+    #[test]
+    fn the_site_bulkhead_sheds_past_its_limit_and_refills() {
+        let pool = pool_with(2);
+        let a = pool.lease("s", None).expect("first");
+        let b = pool.lease("s", None).expect("second");
+        assert_eq!(pool.site_inflight("s"), Some(2));
+        let err = pool.lease("s", None).expect_err("third must be shed");
+        assert!(err.chain().any(|c| c.is::<SiteBusy>()), "{err:#}");
+        drop(a);
+        let _c = pool.lease("s", None).expect("a permit came back");
+        drop(b);
+        assert_eq!(pool.site_inflight("s"), Some(1));
+    }
+
+    #[test]
+    fn a_config_sync_keeps_the_sites_bulkhead() {
+        let pool = pool_with(1);
+        let held = pool.lease("s", None).expect("lease");
+        pool.sync_sites(&[site_cfg()]);
+        // A fresh semaphore here would have doubled the site's allowance.
+        assert!(pool.lease("s", None).is_err());
+        drop(held);
+        assert!(pool.lease("s", None).is_ok());
+    }
+
+    #[test]
+    fn a_shed_probe_is_given_back() {
+        let pool = pool_with(1);
+        let h = Arc::clone(&pool.sites.get("s").unwrap().servers[0]);
+        let _held = Lease::new(
+            Arc::clone(&h),
+            false,
+            Duration::from_secs(1),
+            None,
+            Some(
+                Arc::clone(&pool.sites.get("s").unwrap().inflight)
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
+        );
+        // Trip it with a zero-length window so it is half-open now, whatever
+        // the process clock reads (it starts at 0 when the process does).
+        trip(&h, 0);
+        h.open_for_ms.store(0, Ordering::Relaxed);
+        let err = pool.lease("s", None).expect_err("bulkhead full");
+        assert!(err.chain().any(|c| c.is::<SiteBusy>()));
+        assert!(
+            !h.probe_in_flight.load(Ordering::Relaxed),
+            "a probe that was never sent must not hold the half-open slot"
+        );
+    }
+
+    #[test]
+    fn default_site_limit_is_half_the_node() {
+        std::env::remove_var("SENTINEL_SITE_MAX_INFLIGHT_REQUESTS");
+        assert_eq!(site_inflight_limit(8192), 4096);
+        assert_eq!(site_inflight_limit(1), 1);
     }
 }

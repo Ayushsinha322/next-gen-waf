@@ -84,7 +84,8 @@ use sentinel_telemetry::{
     bot_good_bot_allowed_total, dec_active_connections, graphql_blocked_total,
     graphql_inspected_total, grpc_inspected_total, history_shed_total, inc_active_connections,
     inc_blocked, inc_ebpf_drops, inc_history_shed, inc_load_shed_connections,
-    inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits, ja4_attempts_total,
+    inc_load_shed_requests, inc_log_lines_dropped, inc_requests, inc_rule_hits,
+    inc_upstream_circuit_rejections, inc_upstream_site_shed, ja4_attempts_total,
     ja4_h3_absent_total, ja4_h3_attempts_total, ja4_h3_success_total, ja4_no_hello_total,
     ja4_success_total, note_autoban, note_good_bot_allowed, note_graphql_blocked,
     note_graphql_inspected, note_grpc_inspected, note_ja4_attempt, note_ja4_no_hello,
@@ -3551,17 +3552,37 @@ async fn proxy(
     match result {
         Ok(r) => r,
         Err(e) => {
-            // The error text is the operator's only clue about WHY the gateway
-            // failed — origin refused, no site matched, body unreadable — so it
-            // goes on the log line rather than only into a tracing event that
-            // nothing aggregates.
-            error!(
-                request_id = %ctx.request_id,
-                client_ip = %ctx.client_ip,
-                "proxy error: {e:#}"
-            );
+            let retry_after = gateway_retry_after(&e);
+            if retry_after.is_some() {
+                // A shed by design — the origin's circuit is open, or the site is
+                // at its in-flight limit. The breaker logs once when it opens and
+                // once when it closes; a line per refused request would bury the
+                // log in exactly the outage someone is trying to read it during.
+                // The access log still records each one, with its reason.
+                debug!(
+                    request_id = %ctx.request_id,
+                    client_ip = %ctx.client_ip,
+                    "proxy shed: {e:#}"
+                );
+            } else {
+                // The error text is the operator's only clue about WHY the gateway
+                // failed — origin refused, no site matched, body unreadable — so it
+                // goes on the log line rather than only into a tracing event that
+                // nothing aggregates.
+                error!(
+                    request_id = %ctx.request_id,
+                    client_ip = %ctx.client_ip,
+                    "proxy error: {e:#}"
+                );
+            }
             let status = gateway_error_status(&e);
-            let resp = error_response(status, status.canonical_reason().unwrap_or("Bad Gateway"));
+            let mut resp =
+                error_response(status, status.canonical_reason().unwrap_or("Bad Gateway"));
+            if let Some(secs) = retry_after {
+                if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
             stamp_response(&mut ctx, &resp);
             ctx.gateway_error = Some(cap_field(&format!("{e:#}"), 512));
             ctx.advance_phase(Phase::Logging);
@@ -3574,19 +3595,37 @@ async fn proxy(
 /// The status for a request that failed before the origin produced a response.
 ///
 /// 504 when the origin was reached but did not answer within the site's read
-/// timeout — the application is slow or hung. 502 for everything else: refused,
-/// unreachable, TLS failure, no healthy upstream, no matching site. Telling the
-/// two apart is the first thing an operator needs when a site stops working,
-/// and it used to be impossible because both were 502.
+/// timeout — the application is slow or hung. 503 when the request was not sent
+/// at all, by design: the origin's circuit is open (it is known to be down) or
+/// the site already has its limit of requests waiting on it. 502 for everything
+/// else: refused, unreachable, TLS failure, no matching site. Telling these
+/// apart is the first thing an operator needs when a site stops working, and it
+/// used to be impossible because all of them were 502.
 ///
 /// Walks the whole error chain, since the timeout is wrapped in context on its
 /// way up, and matches on the TYPE so rewording a message cannot change a status.
 fn gateway_error_status(e: &anyhow::Error) -> StatusCode {
-    if e.chain().any(|c| c.is::<upstream::UpstreamTimeout>()) {
+    if gateway_retry_after(e).is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if e.chain().any(|c| c.is::<upstream::UpstreamTimeout>()) {
         StatusCode::GATEWAY_TIMEOUT
     } else {
         StatusCode::BAD_GATEWAY
     }
+}
+
+/// Retry-After, in whole seconds (at least 1), for a request shed by design;
+/// `None` for every other failure.
+fn gateway_retry_after(e: &anyhow::Error) -> Option<u64> {
+    for c in e.chain() {
+        if let Some(u) = c.downcast_ref::<upstream::OriginUnavailable>() {
+            return Some(u.retry_after.as_millis().div_ceil(1000).max(1) as u64);
+        }
+        if c.is::<upstream::SiteBusy>() {
+            return Some(1);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3611,6 +3650,37 @@ mod gateway_error_status_tests {
         ] {
             assert_eq!(gateway_error_status(&e), StatusCode::BAD_GATEWAY, "{e:#}");
         }
+    }
+
+    #[test]
+    fn an_open_circuit_is_503_with_the_time_to_the_next_probe() {
+        let e = anyhow::Error::new(upstream::OriginUnavailable {
+            retry_after: std::time::Duration::from_millis(4_200),
+        })
+        .context("selecting an upstream");
+        assert_eq!(gateway_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway_retry_after(&e), Some(5), "rounded up, never 0");
+        let soon = anyhow::Error::new(upstream::OriginUnavailable {
+            retry_after: std::time::Duration::from_millis(30),
+        });
+        assert_eq!(gateway_retry_after(&soon), Some(1));
+    }
+
+    #[test]
+    fn a_busy_site_is_503_retry_after_one_second() {
+        let e = anyhow::Error::new(upstream::SiteBusy { limit: 4096 });
+        assert_eq!(gateway_error_status(&e), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(gateway_retry_after(&e), Some(1));
+    }
+
+    #[test]
+    fn ordinary_gateway_failures_carry_no_retry_after() {
+        let refused = anyhow::anyhow!("upstream request failed: connection refused");
+        let slow = anyhow::Error::new(upstream::UpstreamTimeout(std::time::Duration::from_secs(
+            60,
+        )));
+        assert_eq!(gateway_retry_after(&refused), None);
+        assert_eq!(gateway_retry_after(&slow), None);
     }
 
     #[test]
@@ -4531,10 +4601,23 @@ async fn proxy_inner(
         ));
     };
 
-    let upstream_srv = state
-        .upstream_pool
-        .select_server(&site_cfg.id, Some(ctx.client_ip))
-        .ok_or_else(|| anyhow!("no healthy upstream for site '{}'", site_cfg.id))?;
+    // The lease is the request's place at the origin: a server picked by the
+    // site's strategy and circuit state, and a slot in the site's bulkhead. It
+    // fails fast — 503, typed — when the origin is known to be down or the site
+    // already has its limit of requests waiting on it. Dropped right after the
+    // response headers arrive, so a long download does not hold the slot.
+    let mut lease = match state.upstream_pool.lease(&site_cfg.id, Some(ctx.client_ip)) {
+        Ok(l) => l,
+        Err(e) => {
+            if e.chain().any(|c| c.is::<upstream::OriginUnavailable>()) {
+                inc_upstream_circuit_rejections();
+            } else if e.chain().any(|c| c.is::<upstream::SiteBusy>()) {
+                inc_upstream_site_shed();
+            }
+            return Err(e);
+        }
+    };
+    let upstream_srv = lease.server().clone();
 
     ctx.upstream_addr = Some(
         format!("{}:{}", upstream_srv.host, upstream_srv.port)
@@ -4645,14 +4728,10 @@ async fn proxy_inner(
     let upstream_start = std::time::Instant::now();
     let upstream_resp = state
         .upstream_pool
-        .send_request(
-            &site_cfg.id,
-            &upstream_srv.host,
-            upstream_srv.port,
-            upstream_req,
-        )
+        .send(&mut lease, upstream_req)
         .await
         .context("upstream request failed")?;
+    drop(lease);
     ctx.upstream_latency_us = Some(upstream_start.elapsed().as_micros() as u64);
 
     // --- Phase 4: Response headers ---

@@ -67,7 +67,9 @@ curl -sk -o /dev/null -w '%{http_code}\n' -H 'Host: www.customer.com' https://12
 ## 2. 502 Bad Gateway
 
 502 means: *a site matched, and the WAF could not get a usable answer from its
-origin.* (A hostname that matches NO site is answered 404 "No site is configured
+origin.* After five in a row the WAF stops trying the origin for a few seconds
+and answers **503** with Retry-After instead — see §6. Either way the origin is
+what to look at. (A hostname that matches NO site is answered 404 "No site is configured
 for this hostname" instead — see §1 step 4. Releases before 1.1.7 answered that
 case with 502 too.)
 
@@ -194,16 +196,23 @@ seconds. Then fix it properly. [ROLLBACK.md](ROLLBACK.md) §1.
 
 ## 6. 503 with Retry-After
 
-The WAF is shedding load on purpose — more requests are in flight than it will
-accept at once. Health, readiness and metrics endpoints are exempt, so monitoring
-keeps working.
+A 503 with a Retry-After header is the WAF answering without contacting the
+origin, on purpose. There are three reasons, and the access log's gateway error
+field says which (search the request's Support ID in Threat Search):
 
-Check whether this is:
+| Gateway error says | What it means | What to do |
+|---|---|---|
+| **origin unavailable: every upstream server's circuit is open** | The origin failed five requests in a row (refused, unreachable, or no answer within the timeout), so the WAF stopped sending it traffic. It lets **one** request through after 5 seconds to test it, then every 10, 20, 30 seconds while it stays down. The first one that succeeds puts the site straight back in service. | Fix the origin — §2's checklist. The site recovers by itself within 30 s of the origin answering; nothing to reset. |
+| **site at its in-flight limit** | One site has half the node's capacity waiting on its origin — almost always a hung or very slow origin. The other sites keep the rest. | Same: the origin is the problem. `SENTINEL_SITE_MAX_INFLIGHT_REQUESTS` in `.env` changes the limit; raise it only for a site that genuinely holds thousands of slow requests open. |
+| *(no gateway error; body says "server at capacity")* | The whole node has more requests in flight than it accepts at once. | A genuine traffic spike or attack → the WAF is doing its job; look at Events and Traffic. Undersized for normal load → escalate to R&D with the numbers from `/metrics`. |
 
-- **A genuine traffic spike or attack** → the WAF is doing its job. Look at
-  Events and Traffic.
-- **The WAF undersized for normal load** → escalate to R&D with the numbers from
-  `/metrics`.
+Health, readiness and metrics endpoints are never shed, so monitoring keeps
+working. On `/metrics` the three are counted separately:
+`sentinel_upstream_circuit_rejections_total`, `sentinel_upstream_site_shed_total`
+and `sentinel_load_shed_requests_total`.
+
+Before 1.1.27 a dead origin produced a slow **502** on every request instead —
+each visitor waited out the connect timeout to find out.
 
 ---
 

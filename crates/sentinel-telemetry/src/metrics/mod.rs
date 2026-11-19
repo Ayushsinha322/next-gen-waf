@@ -460,6 +460,15 @@ struct WafMetrics {
     /// Requests shed with 503 because the global in-flight request limit was
     /// saturated (admission control — bounds HTTP/2 & HTTP/3 stream fan-out).
     pub load_shed_requests_total: Counter,
+    /// Requests answered 503 at once because every origin of the site had an
+    /// open circuit — the origin was known to be down, so it was not tried.
+    pub upstream_circuit_rejections_total: Counter,
+    /// Requests shed with 503 because ONE site already had its share of
+    /// in-flight requests waiting on its origin (the per-site bulkhead).
+    pub upstream_site_shed_total: Counter,
+    /// Requests shed with 503 because the node-wide budget for buffered
+    /// request/response bodies was spent.
+    pub body_buffer_shed_total: Counter,
     /// Notable WAF events (blocks / learning-mode DETECTs) that were NOT recorded
     /// because the in-memory history buffer was full.
     ///
@@ -609,6 +618,18 @@ impl WafMetrics {
             "sentinel_load_shed_requests_total",
             "Total number of requests shed with 503 due to the in-flight request limit",
         );
+        let upstream_circuit_rejections_total = registry.register_counter(
+            "sentinel_upstream_circuit_rejections_total",
+            "Total number of requests answered 503 without contacting the origin because its circuit was open",
+        );
+        let upstream_site_shed_total = registry.register_counter(
+            "sentinel_upstream_site_shed_total",
+            "Total number of requests shed with 503 because their site reached its in-flight limit",
+        );
+        let body_buffer_shed_total = registry.register_counter(
+            "sentinel_body_buffer_shed_total",
+            "Total number of requests shed with 503 because the node's body-buffer memory budget was spent",
+        );
         let history_shed_total = registry.register_counter(
             "sentinel_history_shed_total",
             "Total number of WAF events not recorded because the history buffer was full",
@@ -716,6 +737,9 @@ impl WafMetrics {
             ebpf_drops_total,
             load_shed_connections_total,
             load_shed_requests_total,
+            upstream_circuit_rejections_total,
+            upstream_site_shed_total,
+            body_buffer_shed_total,
             history_shed_total,
             log_lines_dropped_total,
             smuggling_evaluated_total,
@@ -791,6 +815,21 @@ pub fn inc_load_shed_connections() {
 /// global in-flight request limit was saturated.
 pub fn inc_load_shed_requests() {
     WAF_METRICS.load_shed_requests_total.inc();
+}
+
+/// A request answered 503 without contacting its origin: the circuit was open.
+pub fn inc_upstream_circuit_rejections() {
+    WAF_METRICS.upstream_circuit_rejections_total.inc();
+}
+
+/// A request shed because its site had reached its in-flight limit.
+pub fn inc_upstream_site_shed() {
+    WAF_METRICS.upstream_site_shed_total.inc();
+}
+
+/// A request shed because the node's body-buffer budget was spent.
+pub fn inc_body_buffer_shed() {
+    WAF_METRICS.body_buffer_shed_total.inc();
 }
 
 /// Increment the counter of WAF events dropped because the in-memory history
@@ -1192,6 +1231,17 @@ mod tests {
         assert!(text.contains("sentinel_load_shed_connections_total"));
         assert!(text.contains("sentinel_load_shed_requests_total"));
         assert!(text.contains("sentinel_active_connections"));
+        inc_upstream_circuit_rejections();
+        inc_upstream_site_shed();
+        inc_body_buffer_shed();
+        let text = prometheus_text();
+        for name in [
+            "sentinel_upstream_circuit_rejections_total",
+            "sentinel_upstream_site_shed_total",
+            "sentinel_body_buffer_shed_total",
+        ] {
+            assert!(text.contains(name), "{name} not exported");
+        }
     }
 
     /// Every reason is scraped from the start, under one HELP and TYPE, and a
