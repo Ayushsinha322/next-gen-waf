@@ -53,6 +53,18 @@ anything.** The data plane picks up new configuration within about 5 seconds.
 Adding a site, changing a mode, or fixing a false positive is a live operation
 with no downtime.
 
+**In the three-node layout, losing one control-plane node changes nothing you
+can see.** Each WAF node takes its configuration — and the console its API —
+from the first control-plane node that answers, in the order `controlplane`,
+`cp2`, `cp3`, and moves to the next within one sync interval (about 5 seconds)
+when one stops answering. Before 1.1.27 everything went to `controlplane` alone:
+with it down, no configuration change reached any WAF node and the console did
+not load, even though `cp2` and `cp3` were running. Traffic was never affected —
+the WAF nodes keep serving their last configuration either way.
+
+The console page itself is still served by `waf1` only, so with `waf1` down the
+console is unreachable until it returns; customer traffic is not affected.
+
 ---
 
 ## 2. Reaching the console

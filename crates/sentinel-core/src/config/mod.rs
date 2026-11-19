@@ -1662,7 +1662,46 @@ fn read_config_file(path: &Path) -> anyhow::Result<SentinelConfig> {
         &mut cfg,
         std::env::var("SENTINEL_PROXY_PROTOCOL_LISTENERS").ok(),
     );
+    apply_sync_url_env(&mut cfg, std::env::var("SENTINEL_SYNC_URL").ok());
     Ok(cfg)
+}
+
+/// Point config sync at `SENTINEL_SYNC_URL` instead of the file's `sync_url`.
+///
+/// One `sentinel.proxy.yaml` serves every topology, and it names
+/// `http://controlplane:9501` — control-plane node 1. In the three-node layout
+/// that made node 1 the only source of configuration for every WAF node: with
+/// it down, nodes 2 and 3 took over leadership and no WAF node could reach
+/// them, so no site change, certificate or threat-intel update was delivered
+/// until node 1 came back. compose.ha.yml and compose.cluster.yml set this to a
+/// comma-separated list of every control-plane node, which the data plane
+/// walks in order (`sentinel_proxy::sync_endpoints`).
+///
+/// Applied on every read of the file, so a SIGHUP reload keeps it. An empty
+/// value is ignored rather than turning sync off, and so is one with no http(s)
+/// entry at all; single bad entries in a list are dropped, with a warning,
+/// where the list is parsed.
+pub(crate) fn apply_sync_url_env(cfg: &mut SentinelConfig, spec: Option<String>) {
+    let Some(spec) = spec else { return };
+    let entries: Vec<&str> = spec
+        .split(',')
+        .map(|u| u.trim().trim_end_matches('/'))
+        .filter(|u| !u.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    if !entries
+        .iter()
+        .any(|u| u.starts_with("http://") || u.starts_with("https://"))
+    {
+        tracing::warn!(
+            sync_url = %spec,
+            "SENTINEL_SYNC_URL names no http(s) URL — ignored, keeping the file's sync_url"
+        );
+        return;
+    }
+    cfg.cluster.sync_url = Some(entries.join(","));
 }
 
 /// Turn on PROXY protocol for the listeners named in
@@ -1723,6 +1762,42 @@ pub(crate) fn apply_proxy_protocol_env(cfg: &mut SentinelConfig, spec: Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_url_env_overrides_the_file_and_survives_bad_values() {
+        let mut cfg = SentinelConfig::default();
+        cfg.cluster.sync_url = Some("http://controlplane:9501".into());
+
+        super::apply_sync_url_env(&mut cfg, None);
+        assert_eq!(
+            cfg.cluster.sync_url.as_deref(),
+            Some("http://controlplane:9501")
+        );
+        super::apply_sync_url_env(&mut cfg, Some("   ".into()));
+        assert_eq!(
+            cfg.cluster.sync_url.as_deref(),
+            Some("http://controlplane:9501")
+        );
+        super::apply_sync_url_env(&mut cfg, Some("lb:9501".into()));
+        assert_eq!(
+            cfg.cluster.sync_url.as_deref(),
+            Some("http://controlplane:9501"),
+            "a value with no scheme is a mistake, not a URL to sync from"
+        );
+
+        super::apply_sync_url_env(&mut cfg, Some(" http://lb:9501/ ".into()));
+        assert_eq!(cfg.cluster.sync_url.as_deref(), Some("http://lb:9501"));
+
+        super::apply_sync_url_env(
+            &mut cfg,
+            Some("http://controlplane:9501/, http://cp2:9501 ,,http://cp3:9501".into()),
+        );
+        assert_eq!(
+            cfg.cluster.sync_url.as_deref(),
+            Some("http://controlplane:9501,http://cp2:9501,http://cp3:9501"),
+            "a list is kept, normalised, for the data plane to walk"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -40,6 +40,7 @@ pub mod proxy_protocol;
 /// Continuous security-event feed to a SIEM (see the module docs for why the
 /// alert path could not serve this purpose).
 pub mod siem;
+pub mod sync_endpoints;
 pub mod tls;
 pub mod upstream;
 pub mod websocket;
@@ -802,19 +803,35 @@ pub(crate) fn classify_accept_error(e: &std::io::Error) -> AcceptRecovery {
 struct ManagementUpstreams {
     /// Base URL of the dashboard UI, e.g. "http://dashboard:3000".
     dashboard: String,
-    /// Base URL of the control-plane REST/SSE API, e.g. "http://controlplane:9501".
-    api: String,
+    /// The control-plane REST/SSE API: one base, or a comma-separated list to
+    /// fail over between (`SENTINEL_MGMT_API_UPSTREAM`). See sync_endpoints.rs.
+    api: sync_endpoints::SyncEndpoints,
 }
 
 impl ManagementUpstreams {
     /// Build from env, with co-located-dev defaults.
     fn from_env() -> Self {
+        const DEV_API: &str = "http://127.0.0.1:9501";
         let dashboard = std::env::var("SENTINEL_MGMT_DASHBOARD_UPSTREAM")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
         let api = std::env::var("SENTINEL_MGMT_API_UPSTREAM")
-            .unwrap_or_else(|_| "http://127.0.0.1:9501".to_string());
+            .ok()
+            .and_then(|v| sync_endpoints::SyncEndpoints::parse(&v))
+            .unwrap_or_else(|| {
+                sync_endpoints::SyncEndpoints::parse(DEV_API).expect("constant parses")
+            });
         Self { dashboard, api }
     }
+}
+
+/// Whether a management-upstream failure happened before the request reached
+/// the upstream (refused, unreachable, DNS) — the only failure that is safe to
+/// retry elsewhere and the one that says this control-plane node is gone.
+fn is_connect_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<hyper_util::client::legacy::Error>()
+            .is_some_and(|h| h.is_connect())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,8 +1853,18 @@ impl ProxyServer {
             });
         }
 
+        // Every loop below talks to the control plane through this one list, so
+        // when config sync fails over to another control-plane node the others
+        // follow on their next tick. See sync_endpoints.rs.
+        let sync_endpoints: Option<Arc<sync_endpoints::SyncEndpoints>> = cfg
+            .cluster
+            .sync_url
+            .as_deref()
+            .and_then(sync_endpoints::SyncEndpoints::parse)
+            .map(Arc::new);
+
         // --- Background: control-plane site sync ---
-        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+        if let Some(sync_ep) = sync_endpoints.clone() {
             let poll_cfg = Arc::clone(&state.config);
             let poll_pool = Arc::clone(&state.upstream_pool);
             let secs = cfg.cluster.sync_interval_secs.max(1);
@@ -1849,7 +1876,7 @@ impl ProxyServer {
                 note_config_sync_failure(format!("config sync crashed and is restarting: {msg}"))
             };
             panic_guard::supervised!("config sync", on_panic = on_panic, {
-                per_run!(sync_url, poll_cfg, poll_pool, sync_reload_notify);
+                per_run!(sync_ep, poll_cfg, poll_pool, sync_reload_notify);
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
                 let deadline = cp_client::deadline(
@@ -1881,10 +1908,15 @@ impl ProxyServer {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    let sync_url = sync_ep.current();
                     let Some(bytes) =
                         fetch_config_sync(&client, &sync_url, internal_secret.as_deref(), deadline)
                             .await
                     else {
+                        // Unreachable, refused, or not ready (503): try the next
+                        // control-plane node on the next tick. The other loops
+                        // follow, since they read the same list.
+                        sync_ep.failed(&sync_url);
                         continue;
                     };
                     let envelope: ConfigSyncResponse = match serde_json::from_slice(&bytes) {
@@ -2014,7 +2046,7 @@ impl ProxyServer {
         // bytes separately, so a poll costs one small JSON response and a module is
         // downloaded only when its hash is new to this node. That is what makes a
         // 5s poll affordable for multi-megabyte modules.
-        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+        if let Some(sync_ep) = sync_endpoints.clone() {
             let plugin_sync_swap = Arc::clone(&plugin_runtime);
             let sync_site_plugin_swap = Arc::clone(&site_plugins);
             let sync_unresolved_swap = Arc::clone(&unresolved_plugins);
@@ -2023,7 +2055,7 @@ impl ProxyServer {
             let secs = cfg.cluster.sync_interval_secs.max(1);
             panic_guard::supervised!("plugin sync", {
                 per_run!(
-                    sync_url,
+                    sync_ep,
                     plugin_sync_swap,
                     sync_site_plugin_swap,
                     sync_unresolved_swap,
@@ -2053,6 +2085,7 @@ impl ProxyServer {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    let sync_url = sync_ep.current();
 
                     let list_url = format!("{sync_url}/api/v1/internal/plugins");
                     let Ok(uri) = list_url.parse::<hyper::Uri>() else {
@@ -2216,7 +2249,7 @@ impl ProxyServer {
         // endpoint, and on a version change rebuilds + atomically swaps the
         // ThreatFeed so hundreds of thousands of IOCs update without dropping a
         // live request. Uses the same shared-secret auth as config sync.
-        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+        if let Some(sync_ep) = sync_endpoints.clone() {
             let ti_modules = Arc::clone(&modules);
             // Optionally offload high-confidence threat-intel IPs to XDP. Off by
             // default: the block tier is already enforced in userspace, and the
@@ -2246,7 +2279,7 @@ impl ProxyServer {
                 ))
             };
             panic_guard::supervised!("threat-intel sync", on_panic = on_panic, {
-                per_run!(sync_url, ti_modules, ti_ebpf);
+                per_run!(sync_ep, ti_modules, ti_ebpf);
                 type EmptyBody = http_body_util::Empty<bytes::Bytes>;
                 let client: cp_client::CpClient<EmptyBody> = cp_client::client();
                 let deadline = cp_client::deadline(
@@ -2259,7 +2292,7 @@ impl ProxyServer {
                 // `internal_secret_set` is the field that separates "running"
                 // from "running and being refused with 403 forever".
                 info!(
-                    sync_url = %sync_url,
+                    sync_urls = %sync_ep.all().join(","),
                     interval_secs = secs,
                     watch_score,
                     xdp_seed = seed_ti_xdp,
@@ -2275,6 +2308,7 @@ impl ProxyServer {
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    let sync_url = sync_ep.current();
                     let Some((status, bytes)) = fetch_threat_intel(
                         &client,
                         &sync_url,
@@ -2472,7 +2506,7 @@ impl ProxyServer {
         // control plane so the cluster view knows the data plane is alive and
         // how it's doing. Same shared-secret auth. Never blocks the proxy: on
         // any error we warn and keep ticking.
-        if let Some(sync_url) = cfg.cluster.sync_url.clone() {
+        if let Some(sync_ep) = sync_endpoints.clone() {
             let hb_cfg = Arc::clone(&state.config);
             let hb_pool = Arc::clone(&state.upstream_pool);
             let hb_engines = Arc::clone(&state.engines);
@@ -2492,7 +2526,7 @@ impl ProxyServer {
             let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| node_id.clone());
             panic_guard::supervised!("node heartbeat", {
                 per_run!(
-                    sync_url, hb_cfg, hb_pool, hb_engines, hb_ebpf, hb_modules, node_id, hostname
+                    sync_ep, hb_cfg, hb_pool, hb_engines, hb_ebpf, hb_modules, node_id, hostname
                 );
                 type JsonBody = http_body_util::Full<bytes::Bytes>;
                 let client: cp_client::CpClient<JsonBody> = cp_client::client();
@@ -2594,7 +2628,7 @@ impl ProxyServer {
                     })
                     .to_string();
 
-                    let url = format!("{sync_url}/api/v1/internal/nodes/heartbeat");
+                    let url = format!("{}/api/v1/internal/nodes/heartbeat", sync_ep.current());
                     let uri: hyper::Uri = match url.parse() {
                         Ok(u) => u,
                         Err(e) => {
@@ -9760,11 +9794,9 @@ async fn handle_management_request(
     if path.starts_with("/api/v1/internal") {
         return Ok(error_response(StatusCode::NOT_FOUND, "not found"));
     }
-    let base = if management_path_is_control_plane(path) {
-        &mgmt.api
-    } else {
-        &mgmt.dashboard
-    };
+    let to_api = management_path_is_control_plane(path);
+    let api_base = mgmt.api.current();
+    let base = if to_api { &api_base } else { &mgmt.dashboard };
     let pq = req
         .uri()
         .path_and_query()
@@ -9811,9 +9843,45 @@ async fn handle_management_request(
     }
     parts.uri = target_uri;
     parts.version = http::Version::HTTP_11;
+    // Kept for one retry on another control-plane node: only a request with no
+    // body can be re-sent, because the body is consumed by the first attempt.
+    let bodiless = body.size_hint().exact() == Some(0);
+    let retry = (to_api && bodiless && mgmt.api.len() > 1).then(|| {
+        (
+            parts.method.clone(),
+            parts.uri.path_and_query().cloned(),
+            parts.headers.clone(),
+        )
+    });
     let upstream_req = Request::from_parts(parts, body.boxed());
 
-    match state.upstream_pool.forward(upstream_req).await {
+    let mut result = state.upstream_pool.forward(upstream_req).await;
+    if let Err(e) = &result {
+        if to_api && is_connect_failure(e) {
+            // This node is gone. Later requests go to the next one; a request
+            // with no body is re-sent there now, so the console does not even
+            // show the failure.
+            let next = mgmt.api.failed(&api_base);
+            if let (Some((method, pq, mut headers)), true) = (retry, next != api_base) {
+                let target = format!("{next}{}", pq.as_ref().map(|p| p.as_str()).unwrap_or("/"));
+                if let Ok(uri) = target.parse::<Uri>() {
+                    if let Some(auth) = uri.authority() {
+                        if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+                            headers.insert(header::HOST, hv);
+                        }
+                    }
+                    let mut req = Request::new(full_body(Bytes::new()));
+                    *req.method_mut() = method;
+                    *req.uri_mut() = uri;
+                    *req.version_mut() = http::Version::HTTP_11;
+                    *req.headers_mut() = headers;
+                    result = state.upstream_pool.forward(req).await;
+                }
+            }
+        }
+    }
+
+    match result {
         Ok(resp) => {
             let (rp, rb) = resp.into_parts();
             Ok(Response::from_parts(rp, rb.boxed()))
@@ -14154,6 +14222,49 @@ mod empty_sync_guard_tests {
             serves("file-site"),
             "file sites are not the control plane's to remove"
         );
+
+        proxy.stop().await;
+        std::env::remove_var("SENTINEL_CONFIG_CACHE_PATH");
+        let _ = std::fs::remove_file(&cache);
+    }
+
+    /// Control-plane node 1 is down: the node must take its sites from the
+    /// next control-plane node in the list. With one URL — all any WAF node
+    /// had — losing node 1 stopped every config delivery for the cluster.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises whole server runs; see proxy_state_lock
+    async fn a_dead_first_control_plane_is_failed_over() {
+        let _serial = proxy_state_lock();
+        let cache =
+            std::env::temp_dir().join(format!("sk-cp-failover-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&cache);
+        std::env::set_var("SENTINEL_CONFIG_CACHE_PATH", &cache);
+        CONFIG_VERSION_APPLIED.store(0, Ordering::Relaxed);
+        note_config_sync_ok();
+
+        let (origin, _hits) = counting_origin().await;
+        let answer = Arc::new(std::sync::Mutex::new(serde_json::json!({
+            "version": 7, "version_source": "generation", "sites": [{
+                "id": "after-failover",
+                "domains": ["after-failover.sync.local"],
+                "upstream": { "servers": [{ "host": "127.0.0.1", "port": origin.port() }] },
+            }],
+        })));
+        let cp2 = mutable_control_plane(Arc::clone(&answer)).await;
+        // A port nothing listens on: control-plane node 1, gone.
+        let dead = format!("http://127.0.0.1:{}", free_port());
+        let listen = free_port();
+        let mut cfg = site_config(listen, origin, "file-site", vec![]);
+        cfg.cluster.sync_url = Some(format!("{dead},{cp2}"));
+        cfg.cluster.sync_interval_secs = 1;
+        let handle = config_handle(cfg);
+        let proxy = start_proxy(listen, Arc::clone(&handle)).await;
+
+        wait_until(
+            || handle.load().sites.iter().any(|s| s.id == "after-failover"),
+            "the node never took its config from the second control-plane node",
+        )
+        .await;
 
         proxy.stop().await;
         std::env::remove_var("SENTINEL_CONFIG_CACHE_PATH");

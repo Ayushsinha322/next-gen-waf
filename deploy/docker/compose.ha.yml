@@ -160,7 +160,17 @@ x-wafnode: &wafnode
     # sentinel.proxy.yaml) reverse-proxies these. Set on every node; only waf1
     # publishes :9443 to the host, so the others' mgmt listener is inert.
     SENTINEL_MGMT_DASHBOARD_UPSTREAM: http://dashboard:3000
-    SENTINEL_MGMT_API_UPSTREAM: http://controlplane:9501
+    # ── Every control-plane node, not node 1 ─────────────────────────────────
+    # Config sync, threat intel, plugins, heartbeats AND the console's API used
+    # to go to `controlplane:9501` alone, so with node 1 down the cluster's two
+    # surviving control-plane nodes took over leadership and nothing could
+    # reach them: no config reached any WAF node and the console was down. Each
+    # node now walks this list, staying on the first that works (any node will
+    # do — they share one database). A name that does not exist — this overlay
+    # used without compose.cluster.yml — is just skipped. Override both with
+    # SENTINEL_CP_URLS. See crates/sentinel-proxy/src/sync_endpoints.rs.
+    SENTINEL_SYNC_URL: ${SENTINEL_CP_URLS:-http://controlplane:9501,http://cp2:9501,http://cp3:9501}
+    SENTINEL_MGMT_API_UPSTREAM: ${SENTINEL_CP_URLS:-http://controlplane:9501,http://cp2:9501,http://cp3:9501}
     SENTINEL_HTTP3_ADVERTISE_PORT: "443"
     # The `https` listener sits behind HAProxy in tcp mode, so the transport peer
     # is the balancer and the real client arrives in a PROXY protocol header.

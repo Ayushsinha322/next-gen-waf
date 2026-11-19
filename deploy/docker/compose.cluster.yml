@@ -109,6 +109,14 @@ x-cp-env: &cp-env
   # Generate with: openssl rand -hex 32
 
 services:
+  # The standalone data plane, when this overlay is used without compose.ha.yml:
+  # it must reach every control-plane node, not node 1 alone — the reason is on
+  # SENTINEL_SYNC_URL in compose.ha.yml, which sets the same for waf1-3.
+  dataplane:
+    environment:
+      SENTINEL_SYNC_URL: ${SENTINEL_CP_URLS:-http://controlplane:9501,http://cp2:9501,http://cp3:9501}
+      SENTINEL_MGMT_API_UPSTREAM: ${SENTINEL_CP_URLS:-http://controlplane:9501,http://cp2:9501,http://cp3:9501}
+
   # Node 1 = the existing control plane (keeps its image/ports/volumes from
   # compose.prod.yml). Here we fold in the shared env + node-1 raft identity.
   controlplane:

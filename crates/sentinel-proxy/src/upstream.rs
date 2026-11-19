@@ -1064,10 +1064,13 @@ impl UpstreamPool {
         &self,
         req: Request<BoxBody<Bytes, hyper::Error>>,
     ) -> anyhow::Result<http::Response<hyper::body::Incoming>> {
+        // The hyper error is kept as the source, not flattened into text: the
+        // caller fails over to another control-plane node only on a CONNECT
+        // failure, and must be able to ask.
         self.client
             .request(req)
             .await
-            .map_err(|e| anyhow::anyhow!("management upstream request failed: {e}"))
+            .map_err(|e| anyhow::Error::new(e).context("management upstream request failed"))
     }
 
     /// Send a pre-built upstream request under `lease` and return the response.

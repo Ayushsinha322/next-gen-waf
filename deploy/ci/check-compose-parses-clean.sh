@@ -641,6 +641,67 @@ check_nodes_stop_and_are_bounded() {
 }
 check_nodes_stop_and_are_bounded
 
+# ── Every data-plane node reaches every control-plane node ───────────────────
+#
+# Config sync, threat intel, plugins, heartbeats and the console's API all went
+# to `controlplane:9501` — node 1 — so with node 1 down the two surviving
+# control-plane nodes took over leadership and no WAF node could reach them:
+# no config delivered, console down. The nodes now walk a list. This asserts the
+# list in the RENDERED cluster topologies names every control-plane service
+# that exists there, so adding a cp4, or an overlay edit that drops the
+# variable, fails here instead of on the day node 1 dies.
+check_dp_reaches_every_cp() {
+  printf '\n%s==> every data-plane node can reach every control-plane node%s\n\n' "$B" "$R"
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '  %s✗%s jq is not installed — the compose files were NOT checked\n' "$RED" "$R"
+    fail=$((fail + 1)); return
+  fi
+  local label files envf rendered problems=() checked=0
+  for label in cluster cluster+ha; do
+    case "$label" in
+      cluster)    files=(-f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml) ;;
+      cluster+ha) files=(-f deploy/docker/compose.prod.yml -f deploy/docker/compose.cluster.yml
+                         -f deploy/docker/compose.ha.yml) ;;
+    esac
+    envf=$(mktemp); synth_env "$envf" "${IVARS[@]}" "${HVARS[@]}"
+    # The default list is what is under test, not an operator override.
+    sed -i '/^SENTINEL_CP_URLS=/d' "$envf"
+    rendered=$(env -i PATH="$PATH" HOME="$HOME" docker compose --env-file "$envf" "${files[@]}" \
+               config --format json 2>/dev/null) || rendered=""
+    rm -f "$envf"
+    if [[ -z "$rendered" ]]; then
+      printf '  %s✗%s could not render the %s topology\n' "$RED" "$R" "$label"
+      fail=$((fail + 1)); continue
+    fi
+    local cps dp var list cp
+    cps=$(jq -r '.services | to_entries[] | select((.value.image // "") | test("/controlplane:")) | .key' <<<"$rendered")
+    while IFS= read -r dp; do
+      [[ -n "$dp" ]] || continue
+      checked=$((checked + 1))
+      for var in SENTINEL_SYNC_URL SENTINEL_MGMT_API_UPSTREAM; do
+        list=$(jq -r --arg s "$dp" --arg v "$var" '.services[$s].environment[$v] // ""' <<<"$rendered")
+        while IFS= read -r cp; do
+          [[ -n "$cp" ]] || continue
+          grep -qE "(^|,)https?://${cp}:9501(,|$)" <<<"$list" \
+            || problems+=("[$label] $dp: $var does not name control-plane node '$cp' (${list:-unset})")
+        done <<<"$cps"
+      done
+    done < <(jq -r '.services | to_entries[] | select((.value.image // "") | test("/dataplane:")) | select(.value.profiles == null) | .key' <<<"$rendered")
+  done
+  (( checked >= 4 )) || problems+=("only $checked data-plane service(s) recognised in the cluster topologies, expected 4 — the image match in this check is stale")
+  if (( ${#problems[@]} == 0 )); then
+    printf '  %s✓%s %d data-plane services each list every control-plane node for sync and the console API\n' \
+      "$GRN" "$R" "$checked"
+  else
+    local msg
+    for msg in "${problems[@]}"; do
+      printf '  %s✗%s %s\n' "$RED" "$R" "$msg"
+      fail=$((fail + 1))
+    done
+  fi
+}
+check_dp_reaches_every_cp
+
 printf '\n'
 if (( fail )); then
   printf '  %s✗ %d compose problem(s) — an install or a release build would abort%s\n\n' "$RED" "$fail" "$R"
