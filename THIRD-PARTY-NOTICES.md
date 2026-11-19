@@ -117,7 +117,7 @@ Reachable through normal (non-dev, non-build) edges from a shipped binary, so th
 - proc-macro2 1.0.106
 - quinn 0.11.11
 - quinn-proto 0.11.19
-- quinn-udp 0.5.14
+- quinn-udp 0.5.16
 - quote 1.0.45
 - rand 0.10.1
 - rand_core 0.10.1
