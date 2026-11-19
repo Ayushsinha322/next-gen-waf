@@ -103,11 +103,13 @@ hyperscan = "0.3"           # high-perf DPI (optional)
 # and used by nothing; plugins get no WASI. 36.0.20 fixes RUSTSEC-2026-0424
 # (component-model resource transfer), which plugins — core modules loaded with
 # Module::from_binary, no components — never reach; it is taken to keep the
-# audit gate meaningful.
+# audit gate meaningful. 36.0.21 likewise for RUSTSEC-2026-0566/-0569/-0571
+# (2026-11-16); the two from that batch with no 36.x fix are explained in
+# .cargo/audit.toml.
 # Every default feature but `cache`: nothing here configures wasmtime's on-disk
 # compilation cache, and it was the last user of zstd 0.13, whose zstd-safe 7 /
 # zstd-sys 2.0 carry RUSTSEC-2026-0391/-0398/-0403/-0410.
-wasmtime = { version = "36.0.20", default-features = false, features = [
+wasmtime = { version = "36.0.21", default-features = false, features = [
   "async", "gc", "gc-drc", "gc-null", "wat", "profiling", "parallel-compilation",
   "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump",
   "debug-builtins", "runtime", "component-model", "threads", "stack-switching",

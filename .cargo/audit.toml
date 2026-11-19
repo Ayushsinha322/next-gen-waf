@@ -11,4 +11,15 @@ ignore = [
   # maxminddb: `Reader::open_mmap` is unsound. We open the database with
   # `open_readfile` (sentinel-modules/src/geoip). 0.27 is an API break.
   "RUSTSEC-2025-0132",
+  # wasmtime, both published 2026-11-16 with fixes only in 48.0.9+, none in the
+  # 36 LTS line we are on (36.0.21 fixes the other three of that batch).
+  # GHSA-wvgq-g5hf-6gm6: an abort needs a NON-moving GC heap or memory
+  # (`gc_heap_may_move(false)` / `memory_may_move(false)`) AND a reservation
+  # that is not a page multiple. The plugin engine is `Config::default()` plus
+  # fuel and epoch interruption (sentinel-plugins/src/runtime.rs); the advisory
+  # itself says the default configuration is not affected.
+  "RUSTSEC-2026-0573",
+  # GHSA-2674-w29h-wqvj: affects builds WITHOUT the `threads` cargo feature
+  # (39.0.0 onwards). Cargo.toml enables `threads`.
+  "RUSTSEC-2026-0567",
 ]
